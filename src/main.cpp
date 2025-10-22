@@ -1,3 +1,4 @@
+#include "lib/camera.hpp"
 #include <array>
 #include <atomic>
 #include <boost/lockfree/spsc_queue.hpp>
@@ -38,11 +39,6 @@ constexpr const u32 ARENA_SIZE = FRAME_NUM * FRAME_SIZE;
 constexpr const char *OUTFILE = "output/out.h265";
 
 constexpr const u32 DISPLAY_HERTZ = 30;
-
-constexpr const u32 r[3] = {242, 64, 255};
-constexpr const u32 g[3] = {53, 244, 255};
-constexpr const u32 b[3] = {145, 208, 255};
-constexpr const u32 a[3] = {255, 255, 255};
 
 struct FrameMetadata {
     u64 pts;
@@ -86,9 +82,13 @@ int main() {
         free_q.push(static_cast<u16>(i));
     }
 
+    camera::CameraHandle camera_handle = camera::init()[0];
+    camera::set_size(camera_handle, WIDTH, HEIGHT);
+    camera::set_format(camera_handle, camera::RGBA32);
+    camera::set_fps(camera_handle, FPS);
+
     std::thread producer([&]() {
         u64 pts_counter = 0;
-        u32 frame_color_idx = 0;
         while (running) {
             if (paused) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -101,15 +101,8 @@ int main() {
                 continue;
             }
 
-            const u32 pixel_rgba =
-                (a[frame_color_idx] << 24) | (b[frame_color_idx] << 16) |
-                (g[frame_color_idx] << 8) | r[frame_color_idx];
-            frame_color_idx = (frame_color_idx + 1) % 3;
-            u32 *src = reinterpret_cast<u32 *>(
-                arena->data + static_cast<usize>(id) * FRAME_SIZE);
-            for (usize i = 0, k = FRAME_SIZE / 4; i < k; ++i) {
-                src[i] = pixel_rgba;
-            }
+            u8 *src = arena->data + static_cast<usize>(id) * FRAME_SIZE;
+            camera::get_frame(camera_handle, src, FRAME_SIZE);
 
             frame_meta[id].pts = pts_counter;
             frame_meta[id].dts = pts_counter;
@@ -132,6 +125,7 @@ int main() {
             std::println(std::cerr,
                          "ERROR: NVENC encoder 'hevc_nvenc' not found.");
             running = false;
+            camera::shutdown(camera_handle);
             return;
         }
 
@@ -139,6 +133,7 @@ int main() {
         if (!enc_ctx) {
             std::println(std::cerr, "ERROR: avcodec_alloc_context3 failed");
             running = false;
+            camera::shutdown(camera_handle);
             return;
         }
 
@@ -160,6 +155,7 @@ int main() {
             std::println(std::cerr, "ERROR: Could not open encoder");
             avcodec_free_context(&enc_ctx);
             running = false;
+            camera::shutdown(camera_handle);
             return;
         }
 
@@ -171,6 +167,7 @@ int main() {
             std::println(std::cerr, "ERROR: sws_getContext failed");
             avcodec_free_context(&enc_ctx);
             running = false;
+            camera::shutdown(camera_handle);
             return;
         }
 
@@ -180,6 +177,7 @@ int main() {
             sws_freeContext(sws);
             avcodec_free_context(&enc_ctx);
             running = false;
+            camera::shutdown(camera_handle);
             return;
         }
         yuv_frame->format = enc_ctx->pix_fmt;
@@ -191,6 +189,7 @@ int main() {
             sws_freeContext(sws);
             avcodec_free_context(&enc_ctx);
             running = false;
+            camera::shutdown(camera_handle);
             return;
         }
 
@@ -201,6 +200,7 @@ int main() {
             sws_freeContext(sws);
             avcodec_free_context(&enc_ctx);
             running = false;
+            camera::shutdown(camera_handle);
             return;
         }
 
@@ -213,6 +213,7 @@ int main() {
             sws_freeContext(sws);
             avcodec_free_context(&enc_ctx);
             running = false;
+            camera::shutdown(camera_handle);
             return;
         }
 
@@ -321,10 +322,12 @@ int main() {
             while (SDL_PollEvent(&e) != 0) {
                 if (e.type == SDL_QUIT) {
                     running = false;
+                    camera::shutdown(camera_handle);
                 }
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<u32>(1000 / DISPLAY_HERTZ)));
+            std::this_thread::sleep_for(std::chrono::milliseconds(
+                static_cast<u32>(1000 / DISPLAY_HERTZ)));
         }
 
         SDL_DestroyTexture(texture);
@@ -355,8 +358,10 @@ int main() {
         if (ch == 'p') {
             paused = !paused.load();
             std::println("{}", paused ? "Paused" : "Resumed");
+            paused ? camera::stop(camera_handle) : camera::start(camera_handle);
         } else if (ch == 'q') {
             running = false;
+            camera::shutdown(camera_handle);
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
