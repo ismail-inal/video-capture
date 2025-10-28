@@ -3,6 +3,7 @@
 #include <atomic>
 #include <boost/lockfree/spsc_queue.hpp>
 #include <chrono>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <print>
@@ -51,7 +52,7 @@ struct alignas(32) Arena {
     u8 data[ARENA_SIZE];
 };
 
-std::atomic<bool> running = true;
+std::atomic<bool> running = false;
 std::atomic<bool> paused = false;
 std::atomic<u16> g_latest_display_frame_id{FRAME_NUM};
 
@@ -87,21 +88,35 @@ int main() {
     camera::set_format(camera_handle, camera::RGBA32);
     camera::set_fps(camera_handle, FPS);
 
+    std::promise<bool> consumer_ready_promise;
+    std::promise<bool> display_ready_promise;
+    std::future<bool> consumer_ready_future =
+        consumer_ready_promise.get_future();
+    std::future<bool> display_ready_future = display_ready_promise.get_future();
+
     std::thread producer([&]() {
+        while (!running.load(std::memory_order_acquire)) {
+            if (std::this_thread::get_id() == std::thread::id())
+                return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        std::println("Producer thread starting capture.");
+
         u64 pts_counter = 0;
+        u16 id;
+        u8 *src = nullptr;
         while (running) {
             if (paused) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 continue;
             }
 
-            u16 id;
             if (!free_q.pop(id)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
 
-            u8 *src = arena->data + static_cast<usize>(id) * FRAME_SIZE;
+            src = arena->data + static_cast<usize>(id) * FRAME_SIZE;
             camera::get_frame(camera_handle, src, FRAME_SIZE);
 
             frame_meta[id].pts = pts_counter;
@@ -114,26 +129,23 @@ int main() {
             }
 
             ++pts_counter;
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(1000 / FPS));
         }
     });
 
-    std::thread consumer([&]() {
+    std::thread consumer([&, ready_promise =
+                                 std::move(consumer_ready_promise)]() mutable {
         const AVCodec *codec = avcodec_find_encoder_by_name("hevc_nvenc");
         if (!codec) {
             std::println(std::cerr,
                          "ERROR: NVENC encoder 'hevc_nvenc' not found.");
-            running = false;
-            camera::shutdown(camera_handle);
+            ready_promise.set_value(false);
             return;
         }
 
         AVCodecContext *enc_ctx = avcodec_alloc_context3(codec);
         if (!enc_ctx) {
             std::println(std::cerr, "ERROR: avcodec_alloc_context3 failed");
-            running = false;
-            camera::shutdown(camera_handle);
+            ready_promise.set_value(false);
             return;
         }
 
@@ -154,8 +166,7 @@ int main() {
         if (avcodec_open2(enc_ctx, codec, nullptr) < 0) {
             std::println(std::cerr, "ERROR: Could not open encoder");
             avcodec_free_context(&enc_ctx);
-            running = false;
-            camera::shutdown(camera_handle);
+            ready_promise.set_value(false);
             return;
         }
 
@@ -166,8 +177,7 @@ int main() {
         if (!sws) {
             std::println(std::cerr, "ERROR: sws_getContext failed");
             avcodec_free_context(&enc_ctx);
-            running = false;
-            camera::shutdown(camera_handle);
+            ready_promise.set_value(false);
             return;
         }
 
@@ -176,8 +186,7 @@ int main() {
             std::println(std::cerr, "ERROR: av_frame_alloc failed");
             sws_freeContext(sws);
             avcodec_free_context(&enc_ctx);
-            running = false;
-            camera::shutdown(camera_handle);
+            ready_promise.set_value(false);
             return;
         }
         yuv_frame->format = enc_ctx->pix_fmt;
@@ -188,8 +197,7 @@ int main() {
             av_frame_free(&yuv_frame);
             sws_freeContext(sws);
             avcodec_free_context(&enc_ctx);
-            running = false;
-            camera::shutdown(camera_handle);
+            ready_promise.set_value(false);
             return;
         }
 
@@ -199,8 +207,7 @@ int main() {
             av_frame_free(&yuv_frame);
             sws_freeContext(sws);
             avcodec_free_context(&enc_ctx);
-            running = false;
-            camera::shutdown(camera_handle);
+            ready_promise.set_value(false);
             return;
         }
 
@@ -212,10 +219,12 @@ int main() {
             av_frame_free(&yuv_frame);
             sws_freeContext(sws);
             avcodec_free_context(&enc_ctx);
-            running = false;
-            camera::shutdown(camera_handle);
+            ready_promise.set_value(false);
             return;
         }
+
+        std::println("Consumer thread initialized successfully.");
+        ready_promise.set_value(true);
 
         while (running) {
             u16 id;
@@ -268,10 +277,12 @@ int main() {
         avcodec_free_context(&enc_ctx);
     });
 
-    std::thread display([&]() {
+    std::thread display([&, ready_promise =
+                                std::move(display_ready_promise)]() mutable {
         if (SDL_Init(SDL_INIT_VIDEO) < 0) {
             std::println(std::cerr, "SDL could not initialize! SDL_Error: {}",
                          SDL_GetError());
+            ready_promise.set_value(false);
             return;
         }
 
@@ -282,6 +293,8 @@ int main() {
             std::println(std::cerr,
                          "Window could not be created! SDL_Error: {}",
                          SDL_GetError());
+            SDL_Quit();
+            ready_promise.set_value(false);
             return;
         }
 
@@ -291,6 +304,9 @@ int main() {
             std::println(std::cerr,
                          "Renderer could not be created! SDL Error: {}",
                          SDL_GetError());
+            SDL_DestroyWindow(window);
+            SDL_Quit();
+            ready_promise.set_value(false);
             return;
         }
 
@@ -301,8 +317,15 @@ int main() {
             std::println(std::cerr,
                          "Texture could not be created! SDL Error: {}",
                          SDL_GetError());
+            SDL_DestroyRenderer(renderer);
+            SDL_DestroyWindow(window);
+            SDL_Quit();
+            ready_promise.set_value(false);
             return;
         }
+
+        std::println("Display thread initialized successfully.");
+        ready_promise.set_value(true);
 
         while (running) {
             u16 frame_id_to_show =
@@ -322,7 +345,6 @@ int main() {
             while (SDL_PollEvent(&e) != 0) {
                 if (e.type == SDL_QUIT) {
                     running = false;
-                    camera::shutdown(camera_handle);
                 }
             }
 
@@ -336,12 +358,25 @@ int main() {
         SDL_Quit();
     });
 
+    bool consumer_ok = consumer_ready_future.get();
+    bool display_ok = display_ready_future.get();
+
+    if (consumer_ok && display_ok) {
+        std::println("All threads initialized. Starting main loop.");
+        running = true;
+        camera::start(camera_handle);
+    } else {
+        std::println(std::cerr, "ERROR: Thread initialization failed.");
+    }
+
 #ifndef _WIN32
     RawTerm term_guard;
     fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK);
 #endif
 
-    std::println("Press 'p' to pause/resume, 'q' to quit.");
+    if (running) {
+        std::println("Press 'p' to pause/resume, 'q' to quit.");
+    }
 
     while (running) {
         char ch = 0;
@@ -361,16 +396,21 @@ int main() {
             paused ? camera::stop(camera_handle) : camera::start(camera_handle);
         } else if (ch == 'q') {
             running = false;
-            camera::shutdown(camera_handle);
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+    camera::shutdown(camera_handle);
+
     producer.join();
     consumer.join();
     display.join();
 
-    std::println("Finished. Output: {}", OUTFILE);
+    if (consumer_ok && display_ok) {
+        std::println("Finished. Output: {}", OUTFILE);
+    } else {
+        std::println("Finished with initialization errors.");
+    }
     return 0;
 }
