@@ -1,13 +1,19 @@
 #include "cameralibrary.h"
-#include "CameraHelpers.h"
+#include "cameramodulebase.h" // <-- Required for cCameraModule
+#include "frame.h"        // <-- Required for Frame
 
 #include <array>
 #include <atomic>
 #include <boost/lockfree/spsc_queue.hpp>
+#include <chrono>
+#include <future>
 #include <iostream>
+#include <memory>
 #include <print>
 #include <string>
 #include <thread>
+#include <vector>
+#include <cstdint> 
 
 // Non-blocking key-press detection
 #ifdef _WIN32
@@ -52,11 +58,11 @@ using namespace CameraLibrary;
 //== Configuration =========================================================
 
 constexpr const int NUM_CAMERAS = 3;
-constexpr const u32 WIDTH = 1920;
-constexpr const u32 HEIGHT = 1080;
-constexpr const i32 FPS = 250;     // OptiTrack Prime Color 1080p FPS
-constexpr const u32 SECONDS = 1;   // 1 second buffer depth
-constexpr const u32 FRAME_NUM = FPS * SECONDS;
+constexpr const uint32_t WIDTH = 1920;
+constexpr const uint32_t HEIGHT = 1080;
+constexpr const int32_t FPS = 250;
+constexpr const uint32_t SECONDS = 1;
+constexpr const uint32_t FRAME_NUM = FPS * SECONDS;
 constexpr const char *HW_DECODER_NAME = "h264_nvdec"; // Use "h264_videotoolbox" on macOS, "h264_vaapi" on Linux/VAAPI
 
 //== Globals ===============================================================
@@ -67,19 +73,14 @@ std::vector<std::shared_ptr<Camera>> g_cameras;
 std::array<std::string, NUM_CAMERAS> g_camera_serials;
 
 // --- Queues ---
-// 1. Producer -> Distributor (Carries synchronized frame groups)
-boost::lockfree::spsc_queue<FrameGroup*, boost::lockfree::capacity<128>> g_group_q;
-
-// 2. Distributor -> Remuxer Threads (Carries H.264 packets for file)
+// 1. Distributor -> Remuxer Threads (Carries H.264 packets for file)
 std::array<boost::lockfree::spsc_queue<AVPacket*, boost::lockfree::capacity<FRAME_NUM>>, NUM_CAMERAS> g_file_packet_q;
 
-// 3. Distributor -> Display Threads (Carries H.264 packets for display)
+// 2. Distributor -> Display Threads (Carries H.264 packets for display)
 std::array<boost::lockfree::spsc_queue<AVPacket*, boost::lockfree::capacity<FRAME_NUM>>, NUM_CAMERAS> g_display_packet_q;
 
 // --- Packet Pool ---
-// A pool to recycle AVPacket containers. (3 file + 3 display) * FRAME_NUM
 boost::lockfree::spsc_queue<AVPacket*, boost::lockfree::capacity<FRAME_NUM * 6 + 128>> g_packet_pool;
-std::atomic<u64> g_pts_counter{0}; // Global PTS for all streams
 
 //== Packet Pool Helpers ===================================================
 
@@ -95,7 +96,6 @@ AVPacket* acquire_packet() {
     if (g_packet_pool.pop(pkt)) {
         return pkt;
     }
-    // Pool was empty, allocate a new one
     return av_packet_alloc();
 }
 
@@ -104,91 +104,76 @@ void release_packet(AVPacket* pkt) {
     g_packet_pool.push(pkt);
 }
 
-//== Thread 1: Producer ====================================================
+//== Camera Module (Producer) ==============================================
+// This class is our new "producer". An instance will be attached to each camera.
 
-void producer_thread() {
-    std::println("Producer thread started.");
-    while (!g_running.load(std::memory_order_acquire)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+class H264FanoutModule : public cCameraModule {
+private:
+    int m_cam_index;
+    // FIX: This module will own its own counter.
+    std::atomic<uint64_t> m_pts_counter{0};
 
-    while (g_running.load(std::memory_order_relaxed)) {
-        // GetFrameGroup blocks until a synchronized group is ready
-        FrameGroup* group = g_sync_module->GetFrameGroup(); //
+public:
+    // FIX: Removed pts_counter reference
+    H264FanoutModule(int camera_index)
+        : m_cam_index(camera_index) {}
 
-        if (group) {
-            if (!g_group_q.push(group)) {
-                // Queue is full, drop the frame
-                std::println(std::cerr, "WARNING: Distributor queue full, dropping frame group.");
-                group->Release();
-            }
-        }
-    }
-    std::println("Producer thread stopping...");
-}
-
-//== Thread 2: Distributor =================================================
-
-void distributor_thread() {
-    std::println("Distributor thread started.");
-    while (!g_running.load(std::memory_order_acquire)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-
-    FrameGroup* group = nullptr;
-    while (g_running.load(std::memory_order_relaxed)) {
-        if (!g_group_q.pop(group)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
+    // This is the callback from the SDK that provides the H.264 data
+    virtual bool PostVideoData(Camera*, const unsigned char* Buffer, long bufferSize, [[maybe_unused]] const Frame* frame,
+                               [[maybe_unused]] int frameWidth, [[maybe_unused]] int frameHeight, 
+                               [[maybe_unused]] unsigned char* alignedFrameBuffer, [[maybe_unused]] long alignedFrameBufferSize) override 
+    {
+        if (!g_running.load(std::memory_order_relaxed) || !Buffer || bufferSize <= 0) {
+            return true; // Stop processing if not running
         }
 
-        if (!group) continue;
+        // FIX: Use our internal PTS counter, not frame->Timestamp()
+        const uint64_t pts = m_pts_counter.fetch_add(1, std::memory_order_relaxed);
 
-        // Use a single PTS for all packets in this group
-        const u64 pts = g_pts_counter.fetch_add(1, std::memory_order_relaxed);
+        // Get two packets from the pool
+        AVPacket* file_pkt = acquire_packet();
+        AVPacket* display_pkt = acquire_packet();
 
-        for (int i = 0; i < NUM_CAMERAS; ++i) {
-            Frame* frame = group->GetFrame(i);
-            if (!frame || frame->VideoDataSize() <= 0) { //
-                continue;
-            }
+        // Create a new data buffer and copy the frame data into it
+        av_new_packet(file_pkt, bufferSize);
+        std::memcpy(file_pkt->data, Buffer, bufferSize);
 
-            // Get two packets from the pool
-            AVPacket* file_pkt = acquire_packet();
-            AVPacket* display_pkt = acquire_packet();
+        // Share the data buffer between the two packets
+        av_packet_ref(display_pkt, file_pkt);
 
-            // Create a new data buffer and copy the frame data into it
-            // We must copy because the FrameGroup will be released.
-            av_new_packet(file_pkt, frame->VideoDataSize());
-            std::memcpy(file_pkt->data, frame->VideoData(), frame->VideoDataSize()); //
+        // Set timestamps
+        file_pkt->pts = display_pkt->pts = pts;
+        file_pkt->dts = display_pkt->dts = pts;
 
-            // Share the data buffer between the two packets
-            av_packet_ref(display_pkt, file_pkt);
-
-            // Set timestamps
-            file_pkt->pts = display_pkt->pts = pts;
-            file_pkt->dts = display_pkt->dts = pts;
-
-            // Push to file queue
-            if (!g_file_packet_q[i].push(file_pkt)) {
-                std::println(std::cerr, "WARNING: File queue {} full, dropping packet.", i);
-                release_packet(file_pkt);
-            }
-
-            // Push to display queue
-            if (!g_display_packet_q[i].push(display_pkt)) {
-                std::println(std::cerr, "WARNING: Display queue {} full, dropping packet.", i);
-                release_packet(display_pkt);
-            }
+        // Push to file queue
+        if (!g_file_packet_q[m_cam_index].push(file_pkt)) {
+            std::println(std::cerr, "WARNING: File queue {} full, dropping packet.", m_cam_index);
+            release_packet(file_pkt);
         }
 
-        // Release the frame group back to the SDK
-        group->Release();
-    }
-    std::println("Distributor thread stopping...");
-}
+        // Push to display queue
+        if (!g_display_packet_q[m_cam_index].push(display_pkt)) {
+            std::println(std::cerr, "WARNING: Display queue {} full, dropping packet.", m_cam_index);
+            release_packet(display_pkt);
+        }
 
-//== Threads 3, 4, 5: Remuxers =============================================
+        return true;
+    }
+
+    // This is a "dummy" override. We're not decoding, so we just return true.
+    virtual bool PostVideoData([[maybe_unused]] Camera* cam, [[maybe_unused]] const unsigned char* Buffer, [[maybe_unused]] long bufferSize, 
+                               [[maybe_unused]] const Frame* frame,
+                               [[maybe_unused]] int frameWidth, [[maybe_unused]] int frameHeight, 
+                               [[maybe_unused]] unsigned char* alignedFrameBuffer, [[maybe_unused]] long alignedFrameBufferSize, 
+                               [[maybe_unused]] int pixelFormat) override
+    {
+        // This overload is for decoded data, which we're not handling.
+        // We just call the other PostVideoData, which has the H.264 packet.
+        return PostVideoData(cam, Buffer, bufferSize, frame, frameWidth, frameHeight, alignedFrameBuffer, alignedFrameBufferSize);
+    }
+};
+
+//== Threads 1, 2, 3: Remuxers =============================================
 
 void remuxer_thread(int cam_index) {
     const std::string serial = g_camera_serials[cam_index];
@@ -213,18 +198,17 @@ void remuxer_thread(int cam_index) {
         return;
     }
 
-    // 2. Set Codec Parameters (Crucial for MKV)
-    // We're just passing through, so we don't need a full codec context.
-    // The H.264 stream from the camera is self-contained.
+    // 2. Set Codec Parameters
     out_stream->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
-    out_stream->codecpar->codec_id = AV_CODEC_ID_H264; //
+    out_stream->codecpar->codec_id = AV_CODEC_ID_H264;
     out_stream->codecpar->width = WIDTH;
     out_stream->codecpar->height = HEIGHT;
     out_stream->codecpar->format = AV_PIX_FMT_YUV420P; // Assumed format for H.264
 
     // Set timebase for the output file
-    out_stream->time_base = AVRational{1, FPS};
-    fmt_ctx->streams[0]->time_base = AVRational{1, FPS};
+    // We use the high-resolution timestamp from the camera
+    out_stream->time_base = AVRational{1, 1000000}; // Microsecond precision
+    fmt_ctx->streams[0]->time_base = AVRational{1, 1000000};
 
     // 3. Open Output File
     if (!(fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
@@ -252,13 +236,11 @@ void remuxer_thread(int cam_index) {
             continue;
         }
 
-        // Set packet stream index
         pkt->stream_index = out_stream->index;
-        // No timestamp rescale needed since we set the output timebase to 1/FPS
         pkt->pos = -1;
+        // No PTS rescale needed as we set the timebase to match the frame's timestamp
 
-        // Write the packet directly to the file
-        ret = av_interleaved_write_frame(fmt_ctx, pkt); //
+        ret = av_interleaved_write_frame(fmt_ctx, pkt);
         if (ret < 0) {
             std::println(std::cerr, "WARNING [Remux {}]: Error writing frame.", cam_index);
         }
@@ -275,7 +257,7 @@ void remuxer_thread(int cam_index) {
     avformat_free_context(fmt_ctx);
 }
 
-//== Threads 6, 7, 8: Display ==============================================
+//== Threads 4, 5, 6: Display ==============================================
 
 void display_thread(int cam_index) {
     const std::string serial = g_camera_serials[cam_index];
@@ -320,7 +302,7 @@ void display_thread(int cam_index) {
     decoder = avcodec_find_decoder_by_name(HW_DECODER_NAME);
     if (!decoder) {
         std::println(std::cerr, "ERROR [Display {}]: HW Decoder '{}' not found. Falling back to default H.264.", cam_index, HW_DECODER_NAME);
-        decoder = avcodec_find_decoder(AV_CODEC_ID_H264); //
+        decoder = avcodec_find_decoder(AV_CODEC_ID_H264);
         if (!decoder) {
             std::println(std::cerr, "ERROR [Display {}]: Could not find any H.264 decoder.", cam_index);
             return;
@@ -332,6 +314,9 @@ void display_thread(int cam_index) {
         std::println(std::cerr, "ERROR [Display {}]: Could not allocate decoder context.", cam_index);
         return;
     }
+    
+    // Set timebase for the decoder
+    dec_ctx->time_base = AVRational{1, 1000000}; // Microsecond precision
 
     if (avcodec_open2(dec_ctx, decoder, nullptr) < 0) {
         std::println(std::cerr, "ERROR [Display {}]: Could not open decoder.", cam_index);
@@ -408,37 +393,47 @@ int main() {
 
     // 1. Init SDK
     std::println("Starting Camera Library...");
-    CameraLibraryStartup(); //
-    CameraManager::X().ScanForCameras(); //
+    CameraLibraryStartup();
+    CameraManager::X().ScanForCameras();
 
     CameraList list;
-    CameraManager::X().GetCameraList(list); //
+    CameraManager::X().GetCameraList(list);
     if (list.Count() < NUM_CAMERAS) {
         std::println(std::cerr, "ERROR: Found {} cameras, but {} are required. Exiting.", list.Count(), NUM_CAMERAS);
-        CameraLibraryShutdown(); //
+        CameraLibraryShutdown();
         return -1;
     }
 
     // 2. Init Cameras and Sync Module
     std::println("Found {} cameras. Initializing first {}:", list.Count(), NUM_CAMERAS);
     g_sync_module = new cModuleSync();
+    // FIX: Removed dummy pts_counter
+    
     for (int i = 0; i < NUM_CAMERAS; ++i) {
-        auto cam = CameraManager::X().GetCameraBySerial(list[i].Serial()); //
+        auto cam = CameraManager::X().GetCameraBySerial(list[i].Serial());
         if (!cam) {
             std::println(std::cerr, "ERROR: Could not get camera by serial {}.", list[i].Serial());
             return -1;
         }
         g_cameras.push_back(cam);
-        g_camera_serials[i] = std::to_string(cam->Serial()); //
+        g_camera_serials[i] = std::to_string(cam->Serial());
 
-        std::println("- Cam {}: Serial {} ({})", i, g_camera_serials[i], cam->Name()); //
-        cam->SetVideoType(Core::VideoMode); //
-        g_sync_module->AddCamera(cam.get());
+        std::println("- Cam {}: Serial {} ({})", i, g_camera_serials[i], cam->Name());
+        
+        // Create and attach our custom module to this camera
+        // FIX: Pass only the camera index
+        auto* module = new H264FanoutModule(i);
+        cam->AttachModule(module);
+
+        cam->SetVideoType(Core::VideoMode);
+        
+        // Add camera to the hardware sync group
+        g_sync_module->AddCamera(cam);
     }
 
     std::println("Starting all cameras...");
     for (auto& cam : g_cameras) {
-        cam->Start(); //
+        cam->Start();
     }
     std::println("Hardware sync module and cameras started.");
 
@@ -446,9 +441,7 @@ int main() {
     init_packet_pool();
 
     // 4. Spawn Threads
-    std::println("Spawning 8 threads (1P, 1D, 3R, 3D)...");
-    std::thread prod_t(producer_thread);
-    std::thread dist_t(distributor_thread);
+    std::println("Spawning 6 threads (3R, 3D)...");
     std::array<std::thread, NUM_CAMERAS> remux_threads;
     std::array<std::thread, NUM_CAMERAS> disp_threads;
 
@@ -482,13 +475,13 @@ int main() {
     std::println("Stopping all cameras...");
     for (auto& cam : g_cameras) {
         if (cam->IsCameraRunning()) {
-            cam->Stop(); //
+            cam->Stop();
         }
+        // FIX: Removed cam->ClearModules(). The Camera object owns
+        // the module and will clean it up on destruction/shutdown.
     }
 
     std::println("Joining threads...");
-    prod_t.join();
-    dist_t.join();
     for (int i = 0; i < NUM_CAMERAS; ++i) {
         remux_threads[i].join();
         disp_threads[i].join();
