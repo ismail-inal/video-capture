@@ -401,7 +401,7 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    camera::shutdown(camera_handle);
+    camera::deinit(camera_handle);
 
     producer.join();
     consumer.join();

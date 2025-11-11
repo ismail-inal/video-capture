@@ -17,14 +17,14 @@ void camera::stop(CameraHandle handle) {
     std::println("Started camera. {}", (void *)handle);
 }
 
-void camera::shutdown(CameraHandle handle) {
-    std::println("camera. {}", (void *)handle);
-}
-
 std::vector<camera::CameraHandle> camera::init() {
     std::vector<CameraHandle> camera_handles = {nullptr, nullptr, nullptr};
     return camera_handles;
-};
+}
+
+void camera::deinit(CameraHandle handle) {
+    std::println("camera. {}", (void *)handle);
+}
 
 void camera::set_format(CameraHandle handle, FrameFormat format) {
     std::println("Camera format set. {}, {}", (void *)handle, (i32)format);

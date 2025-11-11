@@ -8,7 +8,7 @@ enum FrameFormat { RGB24, RGBA32, YUV420P, YUV422P };
 typedef usize *CameraHandle;
 
 std::vector<CameraHandle> init();
-void shutdown(CameraHandle handle);
+void deinit(CameraHandle handle);
 void get_frame(CameraHandle handle, u8 *buffer, u32 size);
 void start(CameraHandle handle);
 void stop(CameraHandle handle);
