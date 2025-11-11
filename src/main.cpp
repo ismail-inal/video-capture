@@ -436,8 +436,11 @@ int main() {
         g_sync_module->AddCamera(cam.get());
     }
 
-    g_sync_module->Start();
-    std::println("Hardware sync module started.");
+    std::println("Starting all cameras...");
+    for (auto& cam : g_cameras) {
+        cam->Start(); //
+    }
+    std::println("Hardware sync module and cameras started.");
 
     // 3. Init Packet Pool
     init_packet_pool();
@@ -476,8 +479,12 @@ int main() {
     }
 
     // 6. Shutdown
-    std::println("Stopping sync module...");
-    g_sync_module->Stop();
+    std::println("Stopping all cameras...");
+    for (auto& cam : g_cameras) {
+        if (cam->IsCameraRunning()) {
+            cam->Stop(); //
+        }
+    }
 
     std::println("Joining threads...");
     prod_t.join();
