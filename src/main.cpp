@@ -1,13 +1,14 @@
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+#include <condition_variable>
 
+// --- OptiTrack SDK Includes ---
 #include "camera.h"
 #include "cameralibrary.h"
 #include "cameramanager.h"
@@ -15,6 +16,7 @@
 #include "frame.h"
 #include "synchronizer.h"
 
+#define SDL_MAIN_HANDLED
 extern "C" {
 #include <SDL2/SDL.h>
 #include <libavcodec/avcodec.h>
@@ -114,6 +116,8 @@ template <typename T> class Arena {
     }
 };
 
+// --- Muxer (Recording) Thread ---
+
 struct MuxerParams {
     std::string filename;
     int width;
@@ -211,14 +215,18 @@ void muxer_consumer(MuxerParams params, Arena<CompressedPacket> *arena,
     std::cout << "[Muxer " << params.filename << "] Stopped." << std::endl;
 }
 
+// --- Frame Producer (OptiTrack) Thread ---
+
 void frame_producer(CameraLibrary::Camera *cam, Arena<CompressedPacket> *arena,
                     std::atomic<bool> &running) {
     std::cout << "[Producer " << cam->Serial() << "] Starting..." << std::endl;
 
     while (running) {
+        // cam->NextFrame() blocks until a frame is ready or cam->Stop() is
+        // called
         auto frame = cam->NextFrame();
         if (!frame || !running) {
-            break;
+            break; // Exit thread
         }
 
         int size = cam->CompressedImageSize(frame.get());
@@ -237,10 +245,11 @@ void frame_producer(CameraLibrary::Camera *cam, Arena<CompressedPacket> *arena,
     std::cout << "[Producer " << cam->Serial() << "] Stopped." << std::endl;
 }
 
-void display_consumer(
-    std::vector<std::shared_ptr<CameraLibrary::Camera>> &cameras,
-    std::atomic<int> &active_index, std::atomic<bool> &running, int width,
-    int height) {
+// --- Display Function (now run by main thread) ---
+
+void display_loop(std::vector<std::shared_ptr<CameraLibrary::Camera>> &cameras,
+                  std::atomic<int> &active_index, std::atomic<bool> &running,
+                  int width, int height) {
     SDL_Window *window = nullptr;
     SDL_Renderer *renderer = nullptr;
     SDL_Texture *texture = nullptr;
@@ -399,6 +408,8 @@ void display_consumer(
     std::cout << "[Display] Stopped." << std::endl;
 }
 
+// --- Main Function ---
+
 int main() {
     std::cout << "Starting OptiTrack Capture..." << std::endl;
 
@@ -412,10 +423,12 @@ int main() {
     const int CAM_WIDTH = 1920;
     const int CAM_HEIGHT = 1080;
 
+    // 1. Initialize OptiTrack SDK
     CameraLibraryStartup();
     auto &manager = CameraLibrary::CameraManager::X();
     manager.ScanForCameras();
 
+    // *** Scan Time Fix: Increased to 5 seconds ***
     std::cout << "Scanning for cameras... (waiting 5s)" << std::endl;
     std::this_thread::sleep_for(std::chrono::seconds(5));
 
@@ -431,12 +444,14 @@ int main() {
 
     std::cout << "Found " << list.Count() << " cameras." << std::endl;
 
+    // 2. Apply Hardware Synchronization
     try {
         CameraLibrary::sSyncSettings settings;
         manager.GetSyncSettings(settings);
         settings.Mode = CameraLibrary::SyncModeCustom;
         settings.SyncType = CameraLibrary::SyncTypeWiredSync;
-        settings.SyncInputSource = CameraLibrary::SyncInputSourcePTPInput;
+        settings.SyncInputSource =
+            CameraLibrary::SyncInputSourcePTPInput; // PTP for Ethernet sync
         manager.ApplySyncSettings(settings);
         std::cout << "Hardware synchronization set to PTP." << std::endl;
     } catch (...) {
@@ -444,6 +459,7 @@ int main() {
                   << std::endl;
     }
 
+    // 3. Configure and Start Cameras
     for (int i = 0; i < 3; ++i) {
         auto cam = manager.GetCameraBySerial(list[i].Serial());
         if (!cam) {
@@ -456,9 +472,13 @@ int main() {
         std::cout << "Configuring camera " << cam->Serial() << "..."
                   << std::endl;
 
+        // *** E4 Error Fix: Set H.264 mode AND add compression/exposure
+        // settings ***
         cam->SetVideoType(Core::VideoMode);
-        cam->SetColorCompression(1, 0.4F, 0.30F);
-        cam->SetExposure(3000);
+        // These values are from the SDK sample `QtCameraViewer.cpp`
+        cam->SetColorCompression(1, 0.4F, 0.30F); // Mode, Quality, BitRate
+        cam->SetExposure(
+            3000); // 250 FPS is ~4000us max exposure. 3000 is a safe value.
         cam->SetImagerGain(static_cast<CameraLibrary::eImagerGain>(3));
 
         cam->Start();
@@ -504,6 +524,7 @@ int main() {
         return -1;
     }
 
+    // 4. Launch Producer and Muxer threads
     for (int i = 0; i < 3; ++i) {
         MuxerParams params;
         params.filename = std::to_string(cameras[i]->Serial()) + ".mkv";
@@ -517,19 +538,23 @@ int main() {
                              std::ref(running));
     }
 
-    threads.emplace_back(display_consumer, std::ref(cameras),
-                         std::ref(g_active_display_index), std::ref(running),
-                         CAM_WIDTH, CAM_HEIGHT);
+    // 5. Run Display Loop in Main Thread
+    display_loop(cameras, g_active_display_index, running, CAM_WIDTH,
+                 CAM_HEIGHT);
 
-    for (auto &t : threads) {
-        t.join();
-    }
-
+    // 6. Stop cameras to unblock producer threads
     std::cout << "Shutting down all cameras..." << std::endl;
     for (auto &cam : cameras) {
         cam->Stop();
     }
 
+    // 7. Wait for all threads to finish
+    std::cout << "Waiting for threads to join..." << std::endl;
+    for (auto &t : threads) {
+        t.join();
+    }
+
+    // 8. Final Cleanup
     CameraLibraryShutdown();
     std::cout << "Shutdown complete. Exiting." << std::endl;
 
