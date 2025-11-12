@@ -16,7 +16,7 @@ echo "tryna compile FN."
 
 clang++ "$SOURCE_FILE" -o "$OUTPUT_PATH" \
     -O2 -march=native \
-    -pthread -Wall -Wextra -pedantic -std=c++17 \
+    -pthread -Wall -Wextra -pedantic -std=c++23 \
     -lavcodec -lavutil -lavformat -lswscale -lSDL2 \
     -I"$SDK_INCLUDE_DIR" \
     -L"$SDK_LIB_DIR" -lCameraLibrary \
