@@ -30,10 +30,8 @@ struct CompressedPacket {
     int64_t pts;
 
     CompressedPacket() : pts(0) { data.reserve(256 * 1024); }
-
     CompressedPacket(CompressedPacket &&other) noexcept
         : data(std::move(other.data)), pts(other.pts) {}
-
     CompressedPacket &operator=(CompressedPacket &&other) noexcept {
         if (this != &other) {
             data = std::move(other.data);
@@ -41,12 +39,12 @@ struct CompressedPacket {
         }
         return *this;
     }
-
     CompressedPacket(const CompressedPacket &) = delete;
     CompressedPacket &operator=(const CompressedPacket &) = delete;
 };
 
 #define ARENA_DEPTH 256
+
 template <typename T> class Arena {
     std::vector<T> buffer;
     std::atomic<uint64_t> producer_idx{0};
@@ -56,25 +54,28 @@ template <typename T> class Arena {
     std::condition_variable consumer_cv;
 
     static constexpr uint64_t MASK = ARENA_DEPTH - 1;
-
     static_assert((ARENA_DEPTH & MASK) == 0,
                   "ARENA_DEPTH must be a power of 2");
 
   public:
     Arena() : buffer(ARENA_DEPTH) {}
 
-    std::unique_ptr<T> get_for_producer() {
+    std::unique_ptr<T> get_for_producer(std::atomic<bool> &running) {
         uint64_t p_idx = producer_idx.load(std::memory_order_relaxed);
         uint64_t c_idx = consumer_idx.load(std::memory_order_acquire);
 
         if (p_idx - c_idx >= ARENA_DEPTH) {
             std::unique_lock<std::mutex> lock(mtx);
             producer_cv.wait(lock, [&] {
-                return (producer_idx.load(std::memory_order_relaxed) -
+                return !running.load() ||
+                       (producer_idx.load(std::memory_order_relaxed) -
                         consumer_idx.load(std::memory_order_acquire)) <
-                       ARENA_DEPTH;
+                           ARENA_DEPTH;
             });
         }
+
+        if (!running)
+            return nullptr;
         return std::make_unique<T>();
     }
 
@@ -85,17 +86,26 @@ template <typename T> class Arena {
         consumer_cv.notify_one();
     }
 
-    std::unique_ptr<T> pop() {
+    std::unique_ptr<T> pop(std::atomic<bool> &running) {
         uint64_t c_idx = consumer_idx.load(std::memory_order_relaxed);
         uint64_t p_idx = producer_idx.load(std::memory_order_acquire);
 
         if (c_idx >= p_idx) {
             std::unique_lock<std::mutex> lock(mtx);
             consumer_cv.wait(lock, [&] {
-                return consumer_idx.load(std::memory_order_relaxed) <
-                       producer_idx.load(std::memory_order_acquire);
+                return !running.load() ||
+                       (consumer_idx.load(std::memory_order_relaxed) <
+                        producer_idx.load(std::memory_order_acquire));
             });
         }
+
+        if (!running)
+            return nullptr;
+
+        c_idx = consumer_idx.load(std::memory_order_relaxed);
+        p_idx = producer_idx.load(std::memory_order_acquire);
+        if (c_idx >= p_idx)
+            return nullptr;
 
         auto packet = std::make_unique<T>(std::move(buffer[c_idx & MASK]));
         consumer_idx.store(c_idx + 1, std::memory_order_release);
@@ -169,9 +179,9 @@ void muxer_consumer(MuxerParams params, Arena<CompressedPacket> *arena,
                   << std::endl;
 
         while (running) {
-            auto packet = arena->pop();
-            if (!packet)
-                continue;
+            auto packet = arena->pop(running);
+            if (!packet || !running)
+                break;
 
             AVPacket pkt = {0};
             pkt.data = packet->data.data();
@@ -190,7 +200,6 @@ void muxer_consumer(MuxerParams params, Arena<CompressedPacket> *arena,
 
         std::cout << "[Muxer " << params.filename << "] Stopping..."
                   << std::endl;
-
         av_write_trailer(ofmt_ctx);
 
     } while (false);
@@ -207,23 +216,22 @@ void frame_producer(CameraLibrary::Camera *cam, Arena<CompressedPacket> *arena,
     std::cout << "[Producer " << cam->Serial() << "] Starting..." << std::endl;
 
     while (running) {
-        auto frame = cam->LatestFrame();
-        if (!frame) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
+        auto frame = cam->NextFrame();
+        if (!frame || !running) {
+            break;
         }
 
         int size = cam->CompressedImageSize(frame.get());
         if (size <= 0)
             continue;
 
-        auto packet = arena->get_for_producer();
+        auto packet = arena->get_for_producer(running);
+        if (!packet || !running)
+            break;
 
         packet->data.resize(size);
         cam->CompressedImage(frame.get(), packet->data.data(), size);
-
         packet->pts = frame->HardwareTimeStamp();
-
         arena->push(std::move(packet));
     }
     std::cout << "[Producer " << cam->Serial() << "] Stopped." << std::endl;
@@ -257,7 +265,7 @@ void display_consumer(
         texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32,
                                     SDL_TEXTUREACCESS_STREAMING, width, height);
 
-        for (int i = 0; i < cameras.size(); ++i) {
+        for (size_t i = 0; i < cameras.size(); ++i) {
             const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
             if (!codec) {
                 std::cerr << "H.264 decoder not found" << std::endl;
@@ -362,7 +370,6 @@ void display_consumer(
                 sws_scale(sws_ctx, (const uint8_t *const *)yuv_frame->data,
                           yuv_frame->linesize, 0, yuv_frame->height,
                           rgba_frame->data, rgba_frame->linesize);
-
                 SDL_UpdateTexture(texture, NULL, rgba_frame->data[0],
                                   rgba_frame->linesize[0]);
                 SDL_RenderClear(renderer);
@@ -409,8 +416,8 @@ int main() {
     auto &manager = CameraLibrary::CameraManager::X();
     manager.ScanForCameras();
 
-    std::cout << "Scanning for cameras... (waiting 2s)" << std::endl;
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    std::cout << "Scanning for cameras... (waiting 5s)" << std::endl;
+    std::this_thread::sleep_for(std::chrono::seconds(5));
 
     CameraLibrary::CameraList list;
     manager.GetCameraList(list);
@@ -429,8 +436,7 @@ int main() {
         manager.GetSyncSettings(settings);
         settings.Mode = CameraLibrary::SyncModeCustom;
         settings.SyncType = CameraLibrary::SyncTypeWiredSync;
-        settings.SyncInputSource =
-            CameraLibrary::SyncInputSourcePTPInput;
+        settings.SyncInputSource = CameraLibrary::SyncInputSourcePTPInput;
         manager.ApplySyncSettings(settings);
         std::cout << "Hardware synchronization set to PTP." << std::endl;
     } catch (...) {
@@ -451,7 +457,10 @@ int main() {
                   << std::endl;
 
         cam->SetVideoType(Core::VideoMode);
-        cam->SetFrameRate(250);
+        cam->SetColorCompression(1, 0.4F, 0.30F);
+        cam->SetExposure(3000);
+        cam->SetImagerGain(static_cast<CameraLibrary::eImagerGain>(3));
+
         cam->Start();
 
         cameras.push_back(cam);
@@ -470,8 +479,16 @@ int main() {
             }
             if (frame) {
                 hardware_time_freq = frame->HardwareTimeFreq();
-                std::cout << "Hardware time frequency: " << hardware_time_freq
-                          << " Hz" << std::endl;
+                if (hardware_time_freq == 0) {
+                    std::cerr << "Warning: Hardware time frequency is 0. "
+                                 "Assuming 90000 Hz."
+                              << std::endl;
+                    hardware_time_freq = 90000;
+                } else {
+                    std::cout
+                        << "Hardware time frequency: " << hardware_time_freq
+                        << " Hz" << std::endl;
+                }
             } else {
                 std::cerr << "Failed to get initial frame. Assuming 90000 Hz."
                           << std::endl;
