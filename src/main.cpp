@@ -8,6 +8,7 @@
 #include <print>
 #include <string>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #include <conio.h>
@@ -38,10 +39,10 @@ extern "C" {
 
 constexpr const u32 WIDTH = 1920;
 constexpr const u32 HEIGHT = 1080;
-constexpr const u32 MAX_FRAME_SIZE = 4 * 1024 * 1024; // 4MB
+constexpr const u32 MAX_FRAME_SIZE = 4 * 1024 * 1024;
 
-constexpr const i32 FPS = 120;
-constexpr const u32 SECONDS = 3;
+constexpr const i32 FPS = 250;
+constexpr const u32 SECONDS = 1;
 constexpr const u32 FRAME_NUM = FPS * SECONDS;
 constexpr const u64 ARENA_SIZE = static_cast<u64>(FRAME_NUM) * MAX_FRAME_SIZE;
 
@@ -81,7 +82,6 @@ struct RawTerm {
 struct CameraPipeline {
     std::shared_ptr<CameraLibrary::Camera> camera;
     std::string serial_str;
-    u32 hardware_freq = 0;
     i32 actual_fps = 0;
 
     std::unique_ptr<Arena> arena;
@@ -128,6 +128,8 @@ static void producer(CameraPipeline *p, ControlState *controls) {
     u8 *dest_buf = nullptr;
     auto &cam = p->camera;
 
+    u64 pts_counter = 0;
+
     while (controls->running) {
         if (controls->paused) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -140,18 +142,16 @@ static void producer(CameraPipeline *p, ControlState *controls) {
         }
 
         auto frame = cam->LatestFrame();
-        if (!frame || frame->IsEmpty() || frame->IsInvalid() ||
-            !frame->IsHardwareTimeStamp()) {
+        if (!frame || frame->IsEmpty() || frame->IsInvalid()) {
             p->free_q.push(id);
             std::this_thread::sleep_for(std::chrono::microseconds(500));
             continue;
         }
 
-        u64 hw_ts = frame->HardwareTimeStamp();
         const CameraLibrary::Frame *frame_ptr = frame.get();
         int compressed_size = p->camera->CompressedImageSize(frame_ptr);
 
-        if (compressed_size == 0 || compressed_size > MAX_FRAME_SIZE) {
+        if (compressed_size <= 0 || (u32)compressed_size > MAX_FRAME_SIZE) {
             std::println(std::cerr, "[PROD-{}] Invalid compressed size: {}",
                          p->serial_str, compressed_size);
             p->free_q.push(id);
@@ -159,11 +159,10 @@ static void producer(CameraPipeline *p, ControlState *controls) {
         }
 
         dest_buf = p->arena->data + static_cast<usize>(id) * MAX_FRAME_SIZE;
-
         p->camera->CompressedImage(frame_ptr, dest_buf, compressed_size);
 
-        p->frame_meta[id].pts = hw_ts;
-        p->frame_meta[id].compressed_size = compressed_size;
+        p->frame_meta[id].pts = pts_counter++;
+        p->frame_meta[id].compressed_size = (u32)compressed_size;
         p->frame_meta[id].flags = 0;
 
         while (!p->ready_q.push(id)) {
@@ -198,7 +197,7 @@ static void consumer(CameraPipeline *p, ControlState *controls,
         p->stream->codecpar->height = HEIGHT;
         p->stream->codecpar->format = AV_PIX_FMT_YUVJ420P;
 
-        p->stream->time_base = {1, static_cast<int>(p->hardware_freq)};
+        p->stream->time_base = {1, p->actual_fps};
 
         pkt = av_packet_alloc();
         if (!pkt)
@@ -237,7 +236,7 @@ static void consumer(CameraPipeline *p, ControlState *controls,
         const u8 *compressed_data =
             p->arena->data + static_cast<usize>(id) * MAX_FRAME_SIZE;
 
-        if (av_new_packet(pkt, meta.compressed_size) < 0) {
+        if (av_new_packet(pkt, (int)meta.compressed_size) < 0) {
             std::println(std::cerr, "[CONS-{}] av_new_packet failed",
                          p->serial_str);
             continue;
@@ -270,7 +269,7 @@ static void display(std::array<CameraPipeline *, NUM_CAMERAS> pipelines,
     AVFrame *rgba_frame = nullptr;
     AVPacket *pkt = nullptr;
     SwsContext *sws_ctx = nullptr;
-    u8 *rgba_buffer = nullptr;
+    std::vector<u8> rgba_buffer;
 
     SDL_Window *window = nullptr;
     SDL_Renderer *renderer = nullptr;
@@ -284,8 +283,7 @@ static void display(std::array<CameraPipeline *, NUM_CAMERAS> pipelines,
             SDL_WINDOWPOS_UNDEFINED, WIDTH / 2, HEIGHT / 2, SDL_WINDOW_SHOWN);
         if (!window)
             throw std::runtime_error(SDL_GetError());
-        renderer = SDL_CreateRenderer(window, -1,
-                                      SDL_RENDERER_ACCELERATED); // No VSync
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
         if (!renderer)
             throw std::runtime_error(SDL_GetError());
         texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32,
@@ -317,16 +315,15 @@ static void display(std::array<CameraPipeline *, NUM_CAMERAS> pipelines,
 
         int num_bytes =
             av_image_get_buffer_size(AV_PIX_FMT_RGBA, WIDTH, HEIGHT, 32);
-        rgba_buffer = (u8 *)av_malloc(num_bytes * sizeof(u8));
+        rgba_buffer.resize(num_bytes);
         av_image_fill_arrays(rgba_frame->data, rgba_frame->linesize,
-                             rgba_buffer, AV_PIX_FMT_RGBA, WIDTH, HEIGHT, 32);
+                             rgba_buffer.data(), AV_PIX_FMT_RGBA, WIDTH, HEIGHT,
+                             32);
 
         std::println("Display thread initialized successfully.");
         ready_promise.set_value(true);
     } catch (const std::exception &e) {
         std::println(std::cerr, "[DISPLAY] ERROR: {}", e.what());
-        if (rgba_buffer)
-            av_free(rgba_buffer);
         if (sws_ctx)
             sws_freeContext(sws_ctx);
         if (pkt)
@@ -369,7 +366,7 @@ static void display(std::array<CameraPipeline *, NUM_CAMERAS> pipelines,
                 p->arena->data +
                 static_cast<usize>(frame_id_to_show) * MAX_FRAME_SIZE;
 
-            if (av_new_packet(pkt, meta.compressed_size) < 0)
+            if (av_new_packet(pkt, (int)meta.compressed_size) < 0)
                 continue;
             std::memcpy(pkt->data, compressed_data, meta.compressed_size);
 
@@ -398,7 +395,6 @@ static void display(std::array<CameraPipeline *, NUM_CAMERAS> pipelines,
         }
     }
 
-    av_free(rgba_buffer);
     sws_freeContext(sws_ctx);
     av_packet_free(&pkt);
     av_frame_free(&raw_frame);
@@ -420,25 +416,24 @@ int main() {
     CameraLibrary::CameraManager::X().ScanForCameras();
 
     std::println("[MAIN] Waiting for cameras to initialize...");
-    if (!CameraLibrary::CameraManager::X().WaitForInitialization()) {
-        std::println(std::cerr,
-                     "ERROR: CameraManager failed to initialize (timeout).");
-        CameraLibraryShutdown();
-        return -1;
-    }
-
-    std::println("[MAIN] Cameras initialized. Checking list...");
+    auto start_time = std::chrono::steady_clock::now();
     CameraLibrary::CameraList cam_list;
-    CameraLibrary::CameraManager::X().GetCameraList(cam_list);
-
-    if (cam_list.Count() < NUM_CAMERAS) {
-        std::println(std::cerr, "ERROR: Found {} cameras, but {} are required.",
-                     cam_list.Count(), NUM_CAMERAS);
-        CameraLibraryShutdown();
-        return -1;
+    while (true) {
+        CameraLibrary::CameraManager::X().GetCameraList(cam_list);
+        if (cam_list.Count() >= NUM_CAMERAS) {
+            std::println("[MAIN] Found {} cameras.", cam_list.Count());
+            break;
+        }
+        if (std::chrono::steady_clock::now() - start_time >
+            std::chrono::seconds(5)) {
+            std::println(std::cerr,
+                         "ERROR: Timed out waiting for cameras. Found {}.",
+                         cam_list.Count());
+            CameraLibraryShutdown();
+            return -1;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
-    std::println("[MAIN] Found {} cameras. Initializing first {}.",
-                 cam_list.Count(), NUM_CAMERAS);
 
     std::vector<std::promise<bool>> consumer_ready_promises(NUM_CAMERAS);
     std::vector<std::future<bool>> consumer_ready_futures;
@@ -469,41 +464,14 @@ int main() {
             p_raw->camera->SetVideoType(Core::VideoMode);
             p_raw->camera->SetColorCompression(1, 0.4F, 0.30F);
 
-            p_raw->camera->SetFrameRate(250);
+            p_raw->camera->SetFrameRate(FPS);
             p_raw->actual_fps = p_raw->camera->FrameRate();
-            std::println("[MAIN] Requested FPS 250, Camera {} set to {}",
+            std::println("[MAIN] Requested FPS {}, Camera {} set to {}", FPS,
                          p_raw->serial_str, p_raw->actual_fps);
 
-            std::println("[MAIN] Starting camera {} for HW Freq check...",
-                         p_raw->serial_str);
-            p_raw->camera->Start();
-            std::shared_ptr<const CameraLibrary::Frame> frame;
-            auto start_time = std::chrono::steady_clock::now();
-            while (true) {
-                frame = p_raw->camera->LatestFrame();
-                if (frame && !frame->IsEmpty() &&
-                    frame->IsHardwareTimeStamp()) {
-                    p_raw->hardware_freq = frame->HardwareTimeFreq();
-                    break;
-                }
-                if (std::chrono::steady_clock::now() - start_time >
-                    std::chrono::seconds(2)) {
-                    throw std::runtime_error(
-                        "Failed to get a valid frame from camera " +
-                        p_raw->serial_str);
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-            p_raw->camera->Stop();
-            std::println("[MAIN] Camera {} HW Freq: {}. Stopping camera.",
-                         p_raw->serial_str, p_raw->hardware_freq);
-
-            if (p_raw->hardware_freq == 0) {
-                std::println(std::cerr,
-                             "Warning: Camera {} does not support hardware "
-                             "timestamps. Using FPS.",
-                             p_raw->serial_str);
-                p_raw->hardware_freq = p_raw->actual_fps;
+            if (p_raw->actual_fps == 0) {
+                throw std::runtime_error(
+                    "Camera reported 0 FPS. Is it configured for VideoMode?");
             }
 
             consumer_ready_futures.push_back(
