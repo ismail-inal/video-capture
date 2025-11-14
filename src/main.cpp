@@ -8,7 +8,6 @@
 #include <print>
 #include <string>
 #include <thread>
-#include <vector>
 
 #ifdef _WIN32
 #include <conio.h>
@@ -94,8 +93,7 @@ struct CameraPipeline {
 
     std::atomic<u16> g_latest_display_frame_id{FRAME_NUM};
 
-    AVFormatContext *out_ctx = nullptr;
-    AVStream *stream = nullptr;
+    FILE *file_handle = nullptr;
 
     CameraPipeline() : arena(std::make_unique<Arena>()) {
         for (usize i = 0; i < FRAME_NUM; ++i) {
@@ -104,14 +102,8 @@ struct CameraPipeline {
     }
 
     ~CameraPipeline() {
-        if (out_ctx) {
-            if (out_ctx->pb) {
-                av_write_trailer(out_ctx);
-                if (!(out_ctx->oformat->flags & AVFMT_NOFILE)) {
-                    avio_closep(&out_ctx->pb);
-                }
-            }
-            avformat_free_context(out_ctx);
+        if (file_handle) {
+            std::fclose(file_handle);
         }
     }
 };
@@ -177,50 +169,22 @@ static void producer(CameraPipeline *p, ControlState *controls) {
 
 static void consumer(CameraPipeline *p, ControlState *controls,
                      std::promise<bool> ready_promise) {
-    std::string outfile = p->serial_str + ".mkv";
-    AVPacket *pkt = nullptr;
+
+    std::string outfile = p->serial_str + ".h264";
 
     try {
-        avformat_alloc_output_context2(&p->out_ctx, nullptr, "matroska",
-                                       outfile.c_str());
-        if (!p->out_ctx)
-            throw std::runtime_error(
-                "avformat_alloc_output_context2 (mkv) failed.");
-
-        p->stream = avformat_new_stream(p->out_ctx, nullptr);
-        if (!p->stream)
-            throw std::runtime_error("avformat_new_stream failed.");
-
-        p->stream->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
-        p->stream->codecpar->codec_id = AV_CODEC_ID_MJPEG;
-        p->stream->codecpar->width = WIDTH;
-        p->stream->codecpar->height = HEIGHT;
-        p->stream->codecpar->format = AV_PIX_FMT_YUVJ420P;
-
-        p->stream->time_base = {1, p->actual_fps};
-
-        pkt = av_packet_alloc();
-        if (!pkt)
-            throw std::runtime_error("av_packet_alloc failed.");
-
-        if (!(p->out_ctx->oformat->flags & AVFMT_NOFILE)) {
-            if (avio_open(&p->out_ctx->pb, outfile.c_str(), AVIO_FLAG_WRITE) <
-                0) {
-                throw std::runtime_error("avio_open failed.");
-            }
+        p->file_handle = std::fopen(outfile.c_str(), "wb");
+        if (!p->file_handle) {
+            throw std::runtime_error("Could not open output file: " + outfile);
         }
-        if (avformat_write_header(p->out_ctx, nullptr) < 0)
-            throw std::runtime_error("avformat_write_header failed.");
 
         std::println(
-            "[CONS-{}] Consumer (Remuxer) thread initialized. Output: {}",
+            "[CONS-{}] Consumer (Raw Writer) thread initialized. Output: {}",
             p->serial_str, outfile);
         ready_promise.set_value(true);
 
     } catch (const std::exception &e) {
         std::println(std::cerr, "[CONS-{}] ERROR: {}", p->serial_str, e.what());
-        if (pkt)
-            av_packet_free(&pkt);
         ready_promise.set_value(false);
         return;
     }
@@ -236,20 +200,7 @@ static void consumer(CameraPipeline *p, ControlState *controls,
         const u8 *compressed_data =
             p->arena->data + static_cast<usize>(id) * MAX_FRAME_SIZE;
 
-        if (av_new_packet(pkt, (int)meta.compressed_size) < 0) {
-            std::println(std::cerr, "[CONS-{}] av_new_packet failed",
-                         p->serial_str);
-            continue;
-        }
-        std::memcpy(pkt->data, compressed_data, meta.compressed_size);
-
-        pkt->pts = static_cast<i64>(meta.pts);
-        pkt->dts = static_cast<i64>(meta.pts);
-        pkt->stream_index = p->stream->index;
-        pkt->flags |= AV_PKT_FLAG_KEY;
-
-        av_interleaved_write_frame(p->out_ctx, pkt);
-        av_packet_unref(pkt);
+        std::fwrite(compressed_data, 1, meta.compressed_size, p->file_handle);
 
         while (!p->free_q.push(id)) {
             if (!controls->running)
@@ -258,7 +209,6 @@ static void consumer(CameraPipeline *p, ControlState *controls,
     }
 
     std::println("[CONS-{}] Consumer thread stopping.", p->serial_str);
-    av_packet_free(&pkt);
 }
 
 static void display(std::array<CameraPipeline *, NUM_CAMERAS> pipelines,
@@ -274,6 +224,8 @@ static void display(std::array<CameraPipeline *, NUM_CAMERAS> pipelines,
     SDL_Window *window = nullptr;
     SDL_Renderer *renderer = nullptr;
     SDL_Texture *texture = nullptr;
+
+    AVPixelFormat hw_pix_fmt = AV_PIX_FMT_NV12;
 
     try {
         if (SDL_Init(SDL_INIT_VIDEO) < 0)
@@ -291,13 +243,25 @@ static void display(std::array<CameraPipeline *, NUM_CAMERAS> pipelines,
         if (!texture)
             throw std::runtime_error(SDL_GetError());
 
-        decoder = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
-        if (!decoder)
-            throw std::runtime_error("MJPEG decoder not found.");
+        decoder = avcodec_find_decoder_by_name("h264_cuvid");
+        if (!decoder) {
+            std::println(std::cerr, "WARNING: 'h264_cuvid' (NVENC) not found. "
+                                    "Falling back to CPU decoder 'h264'.");
+            decoder = avcodec_find_decoder(AV_CODEC_ID_H264);
+            hw_pix_fmt = AV_PIX_FMT_YUV420P;
+            if (!decoder)
+                throw std::runtime_error("H.264 decoder not found.");
+        } else {
+            std::println("[DISPLAY] Using 'h264_cuvid' hardware decoder.");
+        }
+
         dec_ctx = avcodec_alloc_context3(decoder);
         if (!dec_ctx)
             throw std::runtime_error(
                 "avcodec_alloc_context3 (decoder) failed.");
+
+        dec_ctx->codec_id = AV_CODEC_ID_H264;
+
         if (avcodec_open2(dec_ctx, decoder, nullptr) < 0)
             throw std::runtime_error("avcodec_open2 (decoder) failed.");
 
@@ -307,8 +271,8 @@ static void display(std::array<CameraPipeline *, NUM_CAMERAS> pipelines,
         if (!raw_frame || !rgba_frame || !pkt)
             throw std::runtime_error("FFmpeg alloc failed.");
 
-        sws_ctx = sws_getContext(WIDTH, HEIGHT, AV_PIX_FMT_YUVJ420P, WIDTH,
-                                 HEIGHT, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr,
+        sws_ctx = sws_getContext(WIDTH, HEIGHT, hw_pix_fmt, WIDTH, HEIGHT,
+                                 AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr,
                                  nullptr, nullptr);
         if (!sws_ctx)
             throw std::runtime_error("sws_getContext (display) failed.");
@@ -347,10 +311,19 @@ static void display(std::array<CameraPipeline *, NUM_CAMERAS> pipelines,
     }
 
     u16 last_displayed_frame_id = FRAME_NUM;
+    int last_active_idx = -1;
 
     while (controls->running) {
         int idx = controls->active_display_idx.load(std::memory_order_relaxed);
         CameraPipeline *p = pipelines[idx];
+
+        if (idx != last_active_idx) {
+            avcodec_flush_buffers(dec_ctx);
+            last_active_idx = idx;
+            last_displayed_frame_id = FRAME_NUM;
+            std::println("[DISPLAY] Switched to camera {}, flushing decoder.",
+                         p->serial_str);
+        }
 
         u16 frame_id_to_show =
             p->g_latest_display_frame_id.load(std::memory_order_acquire);
@@ -371,7 +344,7 @@ static void display(std::array<CameraPipeline *, NUM_CAMERAS> pipelines,
             std::memcpy(pkt->data, compressed_data, meta.compressed_size);
 
             if (avcodec_send_packet(dec_ctx, pkt) == 0) {
-                if (avcodec_receive_frame(dec_ctx, raw_frame) == 0) {
+                while (avcodec_receive_frame(dec_ctx, raw_frame) == 0) {
                     sws_scale(sws_ctx, (const u8 *const *)raw_frame->data,
                               raw_frame->linesize, 0, HEIGHT, rgba_frame->data,
                               rgba_frame->linesize);
