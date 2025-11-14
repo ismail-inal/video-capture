@@ -64,11 +64,20 @@ struct ControlState {
 };
 
 #ifndef _WIN32
-struct RawTerm { /* ... (same as before) ... */
+struct RawTerm {
+    termios orig_termios;
+    RawTerm() {
+        tcgetattr(STDIN_FILENO, &orig_termios);
+        termios raw = orig_termios;
+        raw.c_lflag &= ~(ECHO | ICANON);
+        raw.c_cc[VMIN] = 0;
+        raw.c_cc[VTIME] = 0;
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    }
+    ~RawTerm() { tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios); }
 };
 #endif
 
-// --- Encapsulation Struct ---
 struct CameraPipeline {
     std::shared_ptr<CameraLibrary::Camera> camera;
     std::string serial_str;
@@ -107,7 +116,7 @@ struct CameraPipeline {
     }
 };
 
-void producer(CameraPipeline *p, ControlState *controls) {
+static void producer(CameraPipeline *p, ControlState *controls) {
     while (!controls->running.load(std::memory_order_acquire)) {
         if (std::this_thread::get_id() == std::thread::id())
             return;
@@ -117,7 +126,7 @@ void producer(CameraPipeline *p, ControlState *controls) {
 
     u16 id;
     u8 *dest_buf = nullptr;
-    auto cam = p->camera;
+    auto &cam = p->camera;
 
     while (controls->running) {
         if (controls->paused) {
@@ -130,7 +139,7 @@ void producer(CameraPipeline *p, ControlState *controls) {
             continue;
         }
 
-        auto frame = cam->LatestFrame();
+        auto &frame = cam->LatestFrame();
         if (!frame || frame->IsEmpty() || frame->IsInvalid() ||
             !frame->IsHardwareTimeStamp()) {
             p->free_q.push(id);
@@ -139,7 +148,7 @@ void producer(CameraPipeline *p, ControlState *controls) {
         }
 
         u64 hw_ts = frame->HardwareTimeStamp();
-        const CameraLibrary::Frame* frame_ptr = frame.get();
+        const CameraLibrary::Frame *frame_ptr = frame.get();
         int compressed_size = p->camera->CompressedImageSize(frame_ptr);
 
         if (compressed_size == 0 || compressed_size > MAX_FRAME_SIZE) {
@@ -167,8 +176,8 @@ void producer(CameraPipeline *p, ControlState *controls) {
     std::println("[PROD-{}] Producer thread stopping.", p->serial_str);
 }
 
-void consumer(CameraPipeline *p, ControlState *controls,
-              std::promise<bool> ready_promise) {
+static void consumer(CameraPipeline *p, ControlState *controls,
+                     std::promise<bool> ready_promise) {
     std::string outfile = p->serial_str + ".mkv";
     AVPacket *pkt = nullptr;
 
@@ -253,8 +262,8 @@ void consumer(CameraPipeline *p, ControlState *controls,
     av_packet_free(&pkt);
 }
 
-void display(std::array<CameraPipeline *, NUM_CAMERAS> pipelines,
-             ControlState *controls, std::promise<bool> ready_promise) {
+static void display(std::array<CameraPipeline *, NUM_CAMERAS> pipelines,
+                    ControlState *controls, std::promise<bool> ready_promise) {
     AVCodecContext *dec_ctx = nullptr;
     const AVCodec *decoder = nullptr;
     AVFrame *raw_frame = nullptr;
@@ -445,7 +454,7 @@ int main() {
             CameraPipeline *p_raw = pipelines[i].get();
             pipeline_pointers[i] = p_raw;
 
-            auto entry = cam_list[i];
+            auto &entry = cam_list[i];
 
             p_raw->camera = CameraLibrary::CameraManager::X().GetCameraBySerial(
                 entry.Serial());
