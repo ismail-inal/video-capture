@@ -30,12 +30,10 @@ extern "C" {
 }
 
 #include "Core/Frame.h"
-#include "Core/ModuleVideoDecompressor.h"
 #include "bitmap.h"
 #include "camera.h"
 #include "cameralibrary.h"
 #include "cameramanager.h"
-#include "cameramodule.h"
 #include "frame.h"
 
 constexpr const u32 WIDTH = 1920;
@@ -141,7 +139,8 @@ void producer(CameraPipeline *p, ControlState *controls) {
         }
 
         u64 hw_ts = frame->HardwareTimeStamp();
-        int compressed_size = frame->CompressedImageSize();
+        const CameraLibrary::Frame* frame_ptr = frame.get();
+        int compressed_size = p->camera->CompressedImageSize(frame_ptr);
 
         if (compressed_size == 0 || compressed_size > MAX_FRAME_SIZE) {
             std::println(std::cerr, "[PROD-{}] Invalid compressed size: {}",
@@ -152,7 +151,7 @@ void producer(CameraPipeline *p, ControlState *controls) {
 
         dest_buf = p->arena->data + static_cast<usize>(id) * MAX_FRAME_SIZE;
 
-        frame->CompressedImage(dest_buf, compressed_size);
+        p->camera->CompressedImage(frame_ptr, dest_buf, compressed_size);
 
         p->frame_meta[id].pts = hw_ts;
         p->frame_meta[id].compressed_size = compressed_size;
@@ -404,20 +403,18 @@ void display(std::array<CameraPipeline *, NUM_CAMERAS> pipelines,
 }
 
 int main() {
-    CameraLibrary::cModuleVideoDecompressor::Register();
-
     ControlState control_state;
     std::array<std::unique_ptr<CameraPipeline>, NUM_CAMERAS> pipelines;
 
     std::println("[MAIN] Initializing CameraLibrary...");
-    CameraLibrary::CameraLibraryStartup();
+    CameraLibraryStartup();
     CameraLibrary::CameraManager::X().ScanForCameras();
 
     std::println("[MAIN] Waiting for cameras to initialize...");
     if (!CameraLibrary::CameraManager::X().WaitForInitialization()) {
         std::println(std::cerr,
                      "ERROR: CameraManager failed to initialize (timeout).");
-        CameraLibrary::CameraLibraryShutdown();
+        CameraLibraryShutdown();
         return -1;
     }
 
@@ -428,7 +425,7 @@ int main() {
     if (cam_list.Count() < NUM_CAMERAS) {
         std::println(std::cerr, "ERROR: Found {} cameras, but {} are required.",
                      cam_list.Count(), NUM_CAMERAS);
-        CameraLibrary::CameraLibraryShutdown();
+        CameraLibraryShutdown();
         return -1;
     }
     std::println("[MAIN] Found {} cameras. Initializing first {}.",
@@ -460,7 +457,7 @@ int main() {
 
             std::println("[MAIN] Setting up camera: {}", p_raw->serial_str);
 
-            p_raw->camera->SetVideoType(CameraLibrary::Core::VideoMode);
+            p_raw->camera->SetVideoType(Core::VideoMode);
             p_raw->camera->SetColorCompression(1, 0.4F, 0.30F);
 
             p_raw->camera->SetFrameRate(250);
@@ -510,7 +507,7 @@ int main() {
         std::println(std::cerr, "[MAIN] CRITICAL ERROR during camera init: {}",
                      e.what());
         control_state.running = false;
-        CameraLibrary::CameraLibraryShutdown();
+        CameraLibraryShutdown();
         return -1;
     }
 
@@ -596,7 +593,7 @@ int main() {
         t.join();
 
     CameraLibrary::CameraManager::X().Shutdown();
-    CameraLibrary::CameraLibraryShutdown();
+    CameraLibraryShutdown();
 
     std::println("Finished.");
     return 0;
