@@ -139,7 +139,7 @@ static void producer(CameraPipeline *p, ControlState *controls) {
             continue;
         }
 
-        auto &frame = cam->LatestFrame();
+        auto frame = cam->LatestFrame();
         if (!frame || frame->IsEmpty() || frame->IsInvalid() ||
             !frame->IsHardwareTimeStamp()) {
             p->free_q.push(id);
