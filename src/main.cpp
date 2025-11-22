@@ -1,4 +1,5 @@
 #include "lib/camera.hpp"
+#include <SDL2/SDL_render.h>
 #include <array>
 #include <atomic>
 #include <boost/lockfree/spsc_queue.hpp>
@@ -30,7 +31,7 @@ extern "C" {
 
 constexpr const u32 WIDTH = 1920;
 constexpr const u32 HEIGHT = 1080;
-constexpr const u32 CHANNEL = 4;
+constexpr const u32 CHANNEL = 1;
 constexpr const u32 FRAME_SIZE = WIDTH * HEIGHT * CHANNEL;
 
 constexpr const i32 FPS = 120;
@@ -85,7 +86,7 @@ int main() {
 
     camera::CameraHandle camera_handle = camera::init()[0];
     camera::set_size(camera_handle, WIDTH, HEIGHT);
-    camera::set_format(camera_handle, camera::RGBA32);
+    camera::set_format(camera_handle, camera::GRAY8);
     camera::set_fps(camera_handle, FPS);
 
     std::promise<bool> consumer_ready_promise;
@@ -171,7 +172,7 @@ int main() {
         }
 
         SwsContext *sws = sws_getContext(
-            WIDTH, HEIGHT, AV_PIX_FMT_RGBA, WIDTH, HEIGHT, AV_PIX_FMT_YUV420P,
+            WIDTH, HEIGHT, AV_PIX_FMT_GRAY8, WIDTH, HEIGHT, AV_PIX_FMT_YUV420P,
             SWS_BILINEAR, nullptr, nullptr, nullptr);
 
         if (!sws) {
@@ -311,7 +312,7 @@ int main() {
         }
 
         SDL_Texture *texture =
-            SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32,
+            SDL_CreateTexture(renderer, SDL_PIXELFORMAT_YV12,
                               SDL_TEXTUREACCESS_STREAMING, WIDTH, HEIGHT);
         if (!texture) {
             std::println(std::cerr,
@@ -324,6 +325,9 @@ int main() {
             return;
         }
 
+        const size_t uv_size = (WIDTH / 2) * (HEIGHT / 2);
+        std::vector<u8> dummy_uv(uv_size, 0x80);
+
         std::println("Display thread initialized successfully.");
         ready_promise.set_value(true);
 
@@ -335,8 +339,9 @@ int main() {
                 const u8 *frame_data =
                     arena->data +
                     static_cast<usize>(frame_id_to_show) * FRAME_SIZE;
-                SDL_UpdateTexture(texture, nullptr, frame_data,
-                                  WIDTH * CHANNEL);
+                SDL_UpdateYUVTexture(texture, nullptr, frame_data, WIDTH,
+                                     dummy_uv.data(), WIDTH / 2,
+                                     dummy_uv.data(), WIDTH / 2);
                 SDL_RenderCopy(renderer, texture, nullptr, nullptr);
                 SDL_RenderPresent(renderer);
             }

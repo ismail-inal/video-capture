@@ -3,7 +3,7 @@
 
 namespace camera {
 
-enum FrameFormat { RGB24, RGBA32, YUV420P, YUV422P };
+enum FrameFormat { RGB24, RGBA32, YUV420P, YUV422P, GRAY8 };
 
 typedef usize *CameraHandle;
 

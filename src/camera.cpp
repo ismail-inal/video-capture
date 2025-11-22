@@ -1,12 +1,10 @@
 #include "lib/camera.hpp"
 #include "lib/types.h"
+#include <cstring>
 #include <print>
 
 inline void camera::get_frame(CameraHandle handle, u8 *buffer, u32 size) {
-    u32 *src = reinterpret_cast<u32 *>(buffer);
-    for (usize i = 0, k = size / 4; i < k; ++i) {
-        src[i] = 0xFFC0CB;
-    }
+    std::memset(&buffer, 0xFF, size);
 }
 
 void camera::start(CameraHandle handle) {
