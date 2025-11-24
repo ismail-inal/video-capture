@@ -1,9 +1,8 @@
+#define LIB_CAMERA_IMPLEMENTATION
 #include "lib/camera.hpp"
-#include <SDL2/SDL_render.h>
 #include <array>
 #include <atomic>
 #include <boost/lockfree/spsc_queue.hpp>
-#include <chrono>
 #include <future>
 #include <iostream>
 #include <memory>
@@ -18,10 +17,9 @@
 #include <unistd.h>
 #endif
 
-#include <SDL2/SDL.h>
-
 extern "C" {
 #include "lib/types.h"
+#include <SDL2/SDL.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
@@ -34,8 +32,8 @@ constexpr const u32 HEIGHT = 1080;
 constexpr const u32 CHANNEL = 1;
 constexpr const u32 FRAME_SIZE = WIDTH * HEIGHT * CHANNEL;
 
-constexpr const i32 FPS = 120;
-constexpr const u32 SECONDS = 3;
+constexpr const i32 FPS = 250;
+constexpr const u32 SECONDS = 1;
 constexpr const u32 FRAME_NUM = FPS * SECONDS;
 constexpr const u32 ARENA_SIZE = FRAME_NUM * FRAME_SIZE;
 constexpr const char *OUTFILE = "output/out.h265";
@@ -84,7 +82,7 @@ int main() {
         free_q.push(static_cast<u16>(i));
     }
 
-    camera::CameraHandle camera_handle = camera::init()[0];
+    camera::handle camera_handle = camera::init()[0];
     camera::set_size(camera_handle, WIDTH, HEIGHT);
     camera::set_format(camera_handle, camera::GRAY8);
     camera::set_fps(camera_handle, FPS);
@@ -227,6 +225,12 @@ int main() {
         std::println("Consumer thread initialized successfully.");
         ready_promise.set_value(true);
 
+        while (!running.load(std::memory_order_acquire)) {
+            if (std::this_thread::get_id() == std::thread::id())
+                return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
         while (running) {
             u16 id;
             if (!ready_q.pop(id)) {
@@ -330,6 +334,12 @@ int main() {
 
         std::println("Display thread initialized successfully.");
         ready_promise.set_value(true);
+
+        while (!running.load(std::memory_order_acquire)) {
+            if (std::this_thread::get_id() == std::thread::id())
+                return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
 
         while (running) {
             u16 frame_id_to_show =
