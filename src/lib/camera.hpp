@@ -6,6 +6,7 @@
 #include <cstring>
 #include <memory> // For std::shared_ptr
 #include <print>
+#include <set> // For duplicate filtering
 #include <thread>
 #include <vector>
 
@@ -26,13 +27,35 @@ typedef CameraLibrary::Camera *handle;
 inline std::vector<handle> init() {
 #ifdef LIB_CAMERA_IMPLEMENTATION
     std::vector<handle> handles;
+    std::set<int> seen_serials; // Track serials to prevent duplicates
 
     std::println("Initializing OptiTrack Camera Manager...");
+
+    // FIX 1: Robust Initialization Loop
+    // WaitForInitialization() returns when the *Manager* is ready, but not
+    // necessarily when all ethernet cameras have finished DHCP/Discovery.
     CameraLibrary::CameraManager::X().WaitForInitialization();
 
+    // Additional poll to ensure cameras are actually online
+    // Wait up to 5 seconds for cameras to appear
+    for (int i = 0; i < 50; ++i) {
+        if (CameraLibrary::CameraManager::X().AreCamerasInitialized()) {
+            // Check if we actually see devices
+            CameraLibrary::CameraList temp;
+            CameraLibrary::CameraManager::X().GetCameraList(temp);
+            if (temp.Count() > 0) {
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    // Explicit short delay to let duplicate/ghost entries settle
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
     if (!CameraLibrary::CameraManager::X().AreCamerasInitialized()) {
-        std::println(stderr,
-                     "ERROR: OptiTrack Camera Manager failed to initialize.");
+        std::println(stderr, "ERROR: OptiTrack Camera Manager failed to "
+                             "initialize or no cameras found.");
         return handles;
     }
 
@@ -44,33 +67,55 @@ inline std::vector<handle> init() {
         return handles;
     }
 
-    // 1. Convert CameraEntry objects to Camera* handles
-    // The list[] operator returns a CameraEntry, which contains the UID.
+    std::println("SDK reported {} camera entries (filtering duplicates...)",
+                 list.Count());
+
+    // 2. Convert CameraEntry to Camera* AND Filter Duplicates
     for (int i = 0; i < list.Count(); ++i) {
         const CameraLibrary::CameraEntry &entry = list[i];
 
-        // GetCamera returns std::shared_ptr<Camera>, get raw pointer using
-        // .get()
         auto cam_shared =
             CameraLibrary::CameraManager::X().GetCamera(entry.UID());
         if (cam_shared) {
-            handles.push_back(cam_shared.get());
+            CameraLibrary::Camera *raw_cam = cam_shared.get();
+            int serial = raw_cam->Serial();
+
+            // FIX 2: Check for Duplicates
+            if (seen_serials.find(serial) != seen_serials.end()) {
+                std::println(stderr,
+                             "WARNING: Skipped duplicate handle for Serial {}",
+                             serial);
+                continue;
+            }
+
+            // FIX 3: Check for Error State (E4 often means Sync Signal
+            // missing/unstable) We can't fix hardware errors via code, but we
+            // can log them.
+            if (raw_cam->State() == CameraLibrary::Camera::Uninitialized) {
+                std::println(
+                    stderr,
+                    "WARNING: Camera {} is in Uninitialized/Error state.",
+                    serial);
+            }
+
+            seen_serials.insert(serial);
+            handles.push_back(raw_cam);
         }
     }
 
-    // 2. Sort handles by Serial Number
+    // 3. Sort handles by Serial Number
     std::sort(handles.begin(), handles.end(),
               [](handle a, handle b) { return a->Serial() < b->Serial(); });
 
-    std::println("Found {} cameras.", handles.size());
+    std::println("Finalized {} unique cameras.", handles.size());
 
     for (size_t i = 0; i < handles.size(); i++) {
         handle cam = handles[i];
 
-        // FIX: Use top-level Core namespace
+        // Use top-level Core namespace
         cam->SetVideoType(Core::GrayscaleMode);
 
-        // Turn off numeric LED ID on the camera front
+        // Turn off numeric LED ID
         cam->SetNumeric(false, 0);
 
         std::println("  Cam {}: Serial {}", i, cam->Serial());
@@ -115,15 +160,13 @@ inline void get_frame(handle h, u8 *buffer, u32 size,
     if (!h)
         return;
 
-    (void)size; // Suppress unused warning
+    (void)size;
 
-    // FIX: LatestFrame() returns std::shared_ptr<const Frame>
     std::shared_ptr<const CameraLibrary::Frame> frame = nullptr;
 
     // Blocking wait for a frame.
     while (true) {
         frame = h->LatestFrame();
-        // Check if pointer is valid
         if (frame)
             break;
         std::this_thread::sleep_for(std::chrono::microseconds(10));
@@ -133,8 +176,6 @@ inline void get_frame(handle h, u8 *buffer, u32 size,
         int w = h->Width();
         int h_dim = h->Height();
 
-        // Signature: Rasterize(Camera &camera, int width, int height, int span,
-        // int bitsPerPixel, void *buffer) const
         frame->Rasterize(*h, w, h_dim, w, 8, buffer);
 
         if (out_frame_id) {
@@ -194,14 +235,12 @@ inline void set_format(handle h, FrameFormat format) {
 
     switch (format) {
     case GRAY8:
-        // FIX: Use top-level Core namespace
         h->SetVideoType(Core::GrayscaleMode);
         std::println("Cam {} Set to Grayscale Mode", h->Serial());
         break;
 
     case RGBA32:
     case RGB24:
-        // FIX: Use top-level Core namespace
         h->SetVideoType(Core::MJPEGMode);
         std::println("Cam {} Set to MJPEG Mode (Color)", h->Serial());
         break;
@@ -231,14 +270,13 @@ inline void set_gain(handle h, int gain) {
 
 inline void set_ir_illumination(handle h, bool enable) {
 #ifdef LIB_CAMERA_IMPLEMENTATION
-    // Optional: implementation depends on exact SDK support
+    // Optional
 #endif
 }
 
 inline void set_ir_filter(handle h, bool enable_visible_light) {
 #ifdef LIB_CAMERA_IMPLEMENTATION
     if (h) {
-        // 1 = Visible (IR Cut ON), 0 = IR (IR Cut OFF)
         h->SetIRFilter(enable_visible_light ? 1 : 0);
         std::println("Cam {} Filter: {}", h->Serial(),
                      enable_visible_light ? "Visible" : "IR");
@@ -246,7 +284,6 @@ inline void set_ir_filter(handle h, bool enable_visible_light) {
 #endif
 }
 
-// Deprecated setters
 inline void set_fps(handle h, u32 fps) {}
 inline void set_size(handle h, u32 width, u32 height) {}
 
