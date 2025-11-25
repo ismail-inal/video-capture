@@ -27,50 +27,76 @@ typedef CameraLibrary::Camera *handle;
 inline std::vector<handle> init() {
 #ifdef LIB_CAMERA_IMPLEMENTATION
     std::vector<handle> handles;
-    std::set<int> seen_serials; // Track serials to prevent duplicates
 
+    // We call this to kickstart the manager, but we don't trust it to block
+    // long enough
     std::println("Initializing OptiTrack Camera Manager...");
-
-    // FIX 1: Robust Initialization Loop
-    // WaitForInitialization() returns when the *Manager* is ready, but not
-    // necessarily when all ethernet cameras have finished DHCP/Discovery.
     CameraLibrary::CameraManager::X().WaitForInitialization();
 
-    // Additional poll to ensure cameras are actually online
-    // Wait up to 5 seconds for cameras to appear
-    for (int i = 0; i < 50; ++i) {
+    // ------------------------------------------------------------
+    // ROBUST DISCOVERY LOOP
+    // ------------------------------------------------------------
+    // We wait up to 10 seconds.
+    // We only break if we find 'target_count' UNIQUE serial numbers.
+    // This prevents "ghost" duplicates from tricking the loop into exiting
+    // early.
+    // ------------------------------------------------------------
+    const int target_unique_count = 3;
+    const int timeout_seconds = 10;
+
+    std::println("Scanning for {} UNIQUE cameras (Timeout: {}s)...",
+                 target_unique_count, timeout_seconds);
+
+    auto start_time = std::chrono::steady_clock::now();
+    bool ready = false;
+
+    while (std::chrono::steady_clock::now() - start_time <
+           std::chrono::seconds(timeout_seconds)) {
+
         if (CameraLibrary::CameraManager::X().AreCamerasInitialized()) {
-            // Check if we actually see devices
-            CameraLibrary::CameraList temp;
-            CameraLibrary::CameraManager::X().GetCameraList(temp);
-            if (temp.Count() > 0) {
+            CameraLibrary::CameraList list;
+            CameraLibrary::CameraManager::X().GetCameraList(list);
+
+            // Count UNIQUE serials
+            std::set<int> temp_serials;
+            for (int i = 0; i < list.Count(); ++i) {
+                // We have to fetch the camera to get the serial
+                auto cam_ptr =
+                    CameraLibrary::CameraManager::X().GetCamera(list[i].UID());
+                if (cam_ptr) {
+                    temp_serials.insert(cam_ptr->Serial());
+                }
+            }
+
+            if (temp_serials.size() >= target_unique_count) {
+                std::println("Discovery Success: Found {} unique cameras.",
+                             temp_serials.size());
+                ready = true;
                 break;
             }
         }
+
+        // Brief sleep to yield CPU while waiting
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    // Explicit short delay to let duplicate/ghost entries settle
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-    if (!CameraLibrary::CameraManager::X().AreCamerasInitialized()) {
-        std::println(stderr, "ERROR: OptiTrack Camera Manager failed to "
-                             "initialize or no cameras found.");
-        return handles;
+    if (!ready) {
+        std::println(stderr, "TIMEOUT: Did not find {} unique cameras in time.",
+                     target_unique_count);
+        // We continue anyway, just in case the user wants to run with fewer
+        // cameras
     }
+
+    // ------------------------------------------------------------
+    // FINAL LIST BUILDING
+    // ------------------------------------------------------------
+    // Now we build the actual handle list, filtering duplicates again for
+    // safety.
 
     CameraLibrary::CameraList list;
     CameraLibrary::CameraManager::X().GetCameraList(list);
+    std::set<int> seen_serials;
 
-    if (list.Count() == 0) {
-        std::println("No cameras found.");
-        return handles;
-    }
-
-    std::println("SDK reported {} camera entries (filtering duplicates...)",
-                 list.Count());
-
-    // 2. Convert CameraEntry to Camera* AND Filter Duplicates
     for (int i = 0; i < list.Count(); ++i) {
         const CameraLibrary::CameraEntry &entry = list[i];
 
@@ -80,38 +106,26 @@ inline std::vector<handle> init() {
             CameraLibrary::Camera *raw_cam = cam_shared.get();
             int serial = raw_cam->Serial();
 
-            // FIX 2: Check for Duplicates
             if (seen_serials.find(serial) != seen_serials.end()) {
-                std::println(stderr,
-                             "WARNING: Skipped duplicate handle for Serial {}",
-                             serial);
+                // Silently skip duplicates now
                 continue;
             }
-
-            // [REMOVED] Optional state check causing compilation error
-            // The E4 error (Sync Signal) can be diagnosed by checking if
-            // 'wait_for_sync()' times out later.
 
             seen_serials.insert(serial);
             handles.push_back(raw_cam);
         }
     }
 
-    // 3. Sort handles by Serial Number
+    // Sort by Serial Number
     std::sort(handles.begin(), handles.end(),
               [](handle a, handle b) { return a->Serial() < b->Serial(); });
 
-    std::println("Finalized {} unique cameras.", handles.size());
+    std::println("Initialized {} cameras.", handles.size());
 
     for (size_t i = 0; i < handles.size(); i++) {
         handle cam = handles[i];
-
-        // Use top-level Core namespace
         cam->SetVideoType(Core::GrayscaleMode);
-
-        // Turn off numeric LED ID
         cam->SetNumeric(false, 0);
-
         std::println("  Cam {}: Serial {}", i, cam->Serial());
     }
 
@@ -153,12 +167,10 @@ inline void get_frame(handle h, u8 *buffer, u32 size,
 #ifdef LIB_CAMERA_IMPLEMENTATION
     if (!h)
         return;
-
     (void)size;
 
     std::shared_ptr<const CameraLibrary::Frame> frame = nullptr;
 
-    // Blocking wait for a frame.
     while (true) {
         frame = h->LatestFrame();
         if (frame)
@@ -170,6 +182,7 @@ inline void get_frame(handle h, u8 *buffer, u32 size,
         int w = h->Width();
         int h_dim = h->Height();
 
+        // Use *h for Camera& reference
         frame->Rasterize(*h, w, h_dim, w, 8, buffer);
 
         if (out_frame_id) {
@@ -210,8 +223,7 @@ inline bool wait_for_sync(u32 timeout_ms = 5000) {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-
-    std::println(stderr, "WARNING: Hardware sync timed out or check disabled.");
+    std::println(stderr, "WARNING: Hardware sync timed out.");
     return false;
 #else
     return true;
@@ -232,13 +244,11 @@ inline void set_format(handle h, FrameFormat format) {
         h->SetVideoType(Core::GrayscaleMode);
         std::println("Cam {} Set to Grayscale Mode", h->Serial());
         break;
-
     case RGBA32:
     case RGB24:
         h->SetVideoType(Core::MJPEGMode);
         std::println("Cam {} Set to MJPEG Mode (Color)", h->Serial());
         break;
-
     default:
         std::println(stderr, "WARNING: Format not explicitly supported.");
         break;
