@@ -49,9 +49,8 @@ inline std::vector<handle> init() {
     for (int i = 0; i < list.Count(); ++i) {
         const CameraLibrary::CameraEntry &entry = list[i];
 
-        // FIX 1: GetCamera returns std::shared_ptr<Camera>, get raw pointer
-        // using .get() We assume CameraManager retains ownership/keep-alive of
-        // these cameras.
+        // GetCamera returns std::shared_ptr<Camera>, get raw pointer using
+        // .get()
         auto cam_shared =
             CameraLibrary::CameraManager::X().GetCamera(entry.UID());
         if (cam_shared) {
@@ -60,8 +59,6 @@ inline std::vector<handle> init() {
     }
 
     // 2. Sort handles by Serial Number
-    // This ensures that "Camera 0" is always the same physical unit across
-    // restarts.
     std::sort(handles.begin(), handles.end(),
               [](handle a, handle b) { return a->Serial() < b->Serial(); });
 
@@ -70,8 +67,8 @@ inline std::vector<handle> init() {
     for (size_t i = 0; i < handles.size(); i++) {
         handle cam = handles[i];
 
-        // FIX 2: Correct Enum Scope (CameraLibrary::Core::GrayscaleMode)
-        cam->SetVideoType(CameraLibrary::Core::GrayscaleMode);
+        // FIX: Use top-level Core namespace
+        cam->SetVideoType(Core::GrayscaleMode);
 
         // Turn off numeric LED ID on the camera front
         cam->SetNumeric(false, 0);
@@ -85,8 +82,6 @@ inline std::vector<handle> init() {
 
 inline void deinit(handle h) {
 #ifdef LIB_CAMERA_IMPLEMENTATION
-    // We do NOT call Release() on the camera pointer itself in this SDK
-    // version, as the CameraManager owns the lifetime. We just stop it.
     if (h)
         h->Stop();
 #endif
@@ -120,30 +115,26 @@ inline void get_frame(handle h, u8 *buffer, u32 size,
     if (!h)
         return;
 
-    // Suppress unused parameter warning if size isn't explicitly checked
-    // against h->Width()*h->Height()
-    (void)size;
+    (void)size; // Suppress unused warning
 
-    CameraLibrary::Frame *frame = nullptr;
+    // FIX: LatestFrame() returns std::shared_ptr<const Frame>
+    std::shared_ptr<const CameraLibrary::Frame> frame = nullptr;
 
     // Blocking wait for a frame.
-    // FIX 3: Use LatestFrame() instead of GetLatestFrame() based on error log
-    // suggestion.
     while (true) {
         frame = h->LatestFrame();
+        // Check if pointer is valid
         if (frame)
             break;
         std::this_thread::sleep_for(std::chrono::microseconds(10));
     }
 
     if (frame) {
-        // Rasterize requires the Camera instance, Dimensions, and Span.
         int w = h->Width();
         int h_dim = h->Height();
 
-        // Span is typically Width * BytesPerPixel. For GRAY8, BPP is 8.
         // Signature: Rasterize(Camera &camera, int width, int height, int span,
-        // int bitsPerPixel, void *buffer)
+        // int bitsPerPixel, void *buffer) const
         frame->Rasterize(*h, w, h_dim, w, 8, buffer);
 
         if (out_frame_id) {
@@ -165,9 +156,6 @@ inline int get_serial(handle h) {
 
 inline bool is_synced() {
 #ifdef LIB_CAMERA_IMPLEMENTATION
-    // The specific sync check varies by SDK version.
-    // If GetSynchronizationStatus() is missing, we assume true to allow
-    // running. Ideally: return h->IsSynchronized(); if available.
     return true;
 #else
     return true;
@@ -206,15 +194,15 @@ inline void set_format(handle h, FrameFormat format) {
 
     switch (format) {
     case GRAY8:
-        // FIX 4: Corrected Enum Scope (CameraLibrary::Core::...)
-        h->SetVideoType(CameraLibrary::Core::GrayscaleMode);
+        // FIX: Use top-level Core namespace
+        h->SetVideoType(Core::GrayscaleMode);
         std::println("Cam {} Set to Grayscale Mode", h->Serial());
         break;
 
     case RGBA32:
     case RGB24:
-        // FIX 5: Corrected Enum Scope (CameraLibrary::Core::...)
-        h->SetVideoType(CameraLibrary::Core::MJPEGMode);
+        // FIX: Use top-level Core namespace
+        h->SetVideoType(Core::MJPEGMode);
         std::println("Cam {} Set to MJPEG Mode (Color)", h->Serial());
         break;
 
@@ -243,10 +231,7 @@ inline void set_gain(handle h, int gain) {
 
 inline void set_ir_illumination(handle h, bool enable) {
 #ifdef LIB_CAMERA_IMPLEMENTATION
-    // If SetIRIllumination is missing in your specific header version,
-    // it likely defaults to on/off based on the Video Mode (MJPEG vs
-    // Grayscale). kept empty to avoid compile error: if (h)
-    // h->SetIRIllumination(enable);
+    // Optional: implementation depends on exact SDK support
 #endif
 }
 
