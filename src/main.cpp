@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <boost/lockfree/spsc_queue.hpp>
+#include <filesystem> // Added for directory creation
 #include <future>
 #include <iostream>
 #include <memory>
@@ -33,7 +34,7 @@ extern "C" {
 // --- Configuration Constants ---
 constexpr const u32 WIDTH = 1920;
 constexpr const u32 HEIGHT = 1080;
-constexpr const u32 CHANNEL = 1; // 1 = Grayscale (GRAY8), 4 = Color (RGBA32)
+constexpr const u32 CHANNEL = 1;
 constexpr const u32 FRAME_SIZE = WIDTH * HEIGHT * CHANNEL;
 
 constexpr const i32 FPS = 250;
@@ -42,10 +43,8 @@ constexpr const u32 FRAME_NUM = FPS * SECONDS;
 constexpr const u32 ARENA_SIZE = FRAME_NUM * FRAME_SIZE;
 constexpr const u32 DISPLAY_HERTZ = 30;
 
-// PrimeX Hardware Settings
-constexpr const i32 CAMERA_EXPOSURE =
-    2500;                            // Microseconds (e.g. 2500us = 2.5ms)
-constexpr const i32 CAMERA_GAIN = 4; // Intensity Level 0-8
+constexpr const i32 CAMERA_EXPOSURE = 2500;
+constexpr const i32 CAMERA_GAIN = 4;
 
 std::atomic<bool> g_running = false;
 std::atomic<bool> g_paused = false;
@@ -63,7 +62,7 @@ struct alignas(32) Arena {
 };
 
 struct CameraContext {
-    int id; // Logical Index (0, 1, 2)
+    int id;
     int serial;
     camera::handle cam_handle;
     std::string output_filename;
@@ -78,7 +77,6 @@ struct CameraContext {
 
     std::atomic<u16> latest_frame_id{FRAME_NUM};
 
-    // FFmpeg Contexts
     AVCodecContext *enc_ctx = nullptr;
     AVFrame *yuv_frame = nullptr;
     SwsContext *sws = nullptr;
@@ -147,7 +145,6 @@ void run_capture(CameraContext *ctx) {
             continue;
         }
 
-        // 1. Acquire Buffer Index
         if (!ctx->free_q.pop(id)) {
             std::this_thread::yield();
             continue;
@@ -156,9 +153,6 @@ void run_capture(CameraContext *ctx) {
         u8 *src = ctx->arena->data + static_cast<usize>(id) * FRAME_SIZE;
         u64 hardware_id = 0;
 
-        // 2. Fetch Frame (Polling & De-duplication)
-        // Since we use GetLatestFrame(), we might get duplicates if we poll
-        // faster than FPS. This loop ensures we wait for a strictly new frame.
         int retries = 0;
         while (g_running) {
             camera::get_frame(ctx->cam_handle, src, FRAME_SIZE, &hardware_id);
@@ -167,32 +161,26 @@ void run_capture(CameraContext *ctx) {
                 start_hardware_id = hardware_id;
                 last_hardware_id = hardware_id;
                 first_frame = false;
-                break; // Got first frame
+                break;
             }
 
             if (hardware_id > last_hardware_id) {
                 last_hardware_id = hardware_id;
-                break; // Got new frame
+                break;
             }
 
-            // Duplicate frame detected, wait and retry
             std::this_thread::sleep_for(std::chrono::microseconds(100));
             retries++;
-            // Watchdog: if we get stale frames for too long, just accept it to
-            // avoid hanging
             if (retries > 2000)
                 break;
         }
 
-        // 3. Metadata
         u64 rel_pts = hardware_id - start_hardware_id;
         ctx->frame_meta[id].pts = rel_pts;
         ctx->frame_meta[id].dts = rel_pts;
 
-        // Update live view pointer
         ctx->latest_frame_id.store(id, std::memory_order_release);
 
-        // Push to Encoder
         while (!ctx->ready_q.push(id)) {
             if (!g_running)
                 break;
@@ -232,6 +220,7 @@ void run_encode(CameraContext *ctx, std::promise<bool> ready_promise) {
     }
 
     if (avcodec_open2(ctx->enc_ctx, codec, nullptr) < 0) {
+        std::println(std::cerr, "Cam {} Error: Could not open codec.", ctx->id);
         ready_promise.set_value(false);
         return;
     }
@@ -239,6 +228,8 @@ void run_encode(CameraContext *ctx, std::promise<bool> ready_promise) {
     avformat_alloc_output_context2(&ctx->fmt_ctx, nullptr, "matroska",
                                    ctx->output_filename.c_str());
     if (!ctx->fmt_ctx) {
+        std::println(std::cerr, "Cam {} Error: Could not alloc format context.",
+                     ctx->id);
         ready_promise.set_value(false);
         return;
     }
@@ -251,6 +242,10 @@ void run_encode(CameraContext *ctx, std::promise<bool> ready_promise) {
     if (!(ctx->fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
         if (avio_open(&ctx->fmt_ctx->pb, ctx->output_filename.c_str(),
                       AVIO_FLAG_WRITE) < 0) {
+            std::println(
+                std::cerr,
+                "Cam {} Error: Could not open file '{}'. (Dir exists?)",
+                ctx->id, ctx->output_filename);
             ready_promise.set_value(false);
             return;
         }
@@ -315,7 +310,6 @@ void run_encode(CameraContext *ctx, std::promise<bool> ready_promise) {
         }
     }
 
-    // Flush
     avcodec_send_frame(ctx->enc_ctx, nullptr);
     while (avcodec_receive_packet(ctx->enc_ctx, pkt) == 0) {
         av_packet_rescale_ts(pkt, ctx->enc_ctx->time_base,
@@ -338,6 +332,7 @@ void run_encode(CameraContext *ctx, std::promise<bool> ready_promise) {
 // --- Display Thread ---
 void run_display(std::promise<bool> ready_promise) {
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+        std::println(std::cerr, "SDL Init Failed: {}", SDL_GetError());
         ready_promise.set_value(false);
         return;
     }
@@ -394,6 +389,16 @@ void run_display(std::promise<bool> ready_promise) {
 
 // --- Main Entry ---
 int main() {
+    // 0. CREATE OUTPUT DIRECTORY (Fix for immediate exit)
+    try {
+        std::filesystem::create_directories("output");
+    } catch (const std::exception &e) {
+        std::println(std::cerr,
+                     "ERROR: Could not create 'output' directory: {}",
+                     e.what());
+        return 1;
+    }
+
     // 1. Initialize & Sort Cameras
     auto cam_handles = camera::init();
     if (cam_handles.size() < 3) {
@@ -406,19 +411,14 @@ int main() {
     // 2. Configure Hardware (PrimeX)
     std::println("Configuring Cameras...");
     for (auto h : cam_handles) {
-        // Set Format (GRAY8 = GrayscaleMode, RGBA = MJPEGMode)
         camera::set_format(h, (CHANNEL == 1) ? camera::GRAY8 : camera::RGBA32);
-
-        // Critical for PrimeX Video: Visible Light = Filter ON, IR LEDs OFF.
         camera::set_ir_filter(h, true);
         camera::set_ir_illumination(h, false);
-
-        // Exposure & Gain
         camera::set_exposure(h, CAMERA_EXPOSURE);
         camera::set_gain(h, CAMERA_GAIN);
     }
 
-    // 3. Hardware Sync Check (Wait for Ethernet Box)
+    // 3. Hardware Sync Check
     camera::wait_for_sync(5000);
 
     // 4. Create Contexts
@@ -448,6 +448,7 @@ int main() {
         pool.emplace_back(run_encode, ctx.get(), std::move(enc_prom));
     }
 
+    // 6. VERIFY INIT
     bool all_ok = true;
     if (!display_futures[0].get()) {
         std::println("Display init failed.");
@@ -455,7 +456,8 @@ int main() {
     }
     for (auto &fut : encoder_futures) {
         if (!fut.get()) {
-            std::println("Encoder init failed.");
+            std::println(
+                "Encoder init failed. (Check 'output' folder permissions)");
             all_ok = false;
         }
     }
