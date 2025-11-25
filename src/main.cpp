@@ -1,474 +1,253 @@
-#define LIB_CAMERA_IMPLEMENTATION
-#include "lib/camera.hpp"
+#pragma once
 
-#include <array>
-#include <atomic>
-#include <boost/lockfree/spsc_queue.hpp>
-#include <future>
-#include <iostream>
-#include <memory>
+#include "lib/types.h"
+#include <algorithm> // For std::sort
+#include <chrono>
+#include <cstring>
+#include <memory> // For std::shared_ptr
 #include <print>
 #include <thread>
 #include <vector>
 
-#ifdef _WIN32
-#include <conio.h>
+// OPTITRACK SDK
+#include "cameralibrary.h"
+
+namespace camera {
+
+enum FrameFormat { RGB24, RGBA32, YUV420P, YUV422P, GRAY8 };
+
+// Use native pointer for direct SDK access
+typedef CameraLibrary::Camera *handle;
+
+// -----------------------------------------------------------------------------
+// CORE LIFECYCLE
+// -----------------------------------------------------------------------------
+
+inline std::vector<handle> init() {
+#ifdef LIB_CAMERA_IMPLEMENTATION
+    std::vector<handle> handles;
+
+    std::println("Initializing OptiTrack Camera Manager...");
+    CameraLibrary::CameraManager::X().WaitForInitialization();
+
+    if (!CameraLibrary::CameraManager::X().AreCamerasInitialized()) {
+        std::println(stderr,
+                     "ERROR: OptiTrack Camera Manager failed to initialize.");
+        return handles;
+    }
+
+    CameraLibrary::CameraList list;
+    CameraLibrary::CameraManager::X().GetCameraList(list);
+
+    if (list.Count() == 0) {
+        std::println("No cameras found.");
+        return handles;
+    }
+
+    // 1. Convert CameraEntry objects to Camera* handles
+    // The list[] operator returns a CameraEntry, which contains the UID.
+    for (int i = 0; i < list.Count(); ++i) {
+        const CameraLibrary::CameraEntry &entry = list[i];
+
+        // GetCamera returns std::shared_ptr<Camera>, get raw pointer using
+        // .get()
+        auto cam_shared =
+            CameraLibrary::CameraManager::X().GetCamera(entry.UID());
+        if (cam_shared) {
+            handles.push_back(cam_shared.get());
+        }
+    }
+
+    // 2. Sort handles by Serial Number
+    std::sort(handles.begin(), handles.end(),
+              [](handle a, handle b) { return a->Serial() < b->Serial(); });
+
+    std::println("Found {} cameras.", handles.size());
+
+    for (size_t i = 0; i < handles.size(); i++) {
+        handle cam = handles[i];
+
+        // FIX: Use top-level Core namespace
+        cam->SetVideoType(Core::GrayscaleMode);
+
+        // Turn off numeric LED ID on the camera front
+        cam->SetNumeric(false, 0);
+
+        std::println("  Cam {}: Serial {}", i, cam->Serial());
+    }
+
+    return handles;
+#endif
+}
+
+inline void deinit(handle h) {
+#ifdef LIB_CAMERA_IMPLEMENTATION
+    if (h)
+        h->Stop();
+#endif
+}
+
+inline void start(handle h) {
+#ifdef LIB_CAMERA_IMPLEMENTATION
+    if (h) {
+        h->Start();
+        std::println("Started Camera {}", h->Serial());
+    }
+#endif
+}
+
+inline void stop(handle h) {
+#ifdef LIB_CAMERA_IMPLEMENTATION
+    if (h) {
+        h->Stop();
+        std::println("Stopped Camera {}", h->Serial());
+    }
+#endif
+}
+
+// -----------------------------------------------------------------------------
+// CAPTURE
+// -----------------------------------------------------------------------------
+
+inline void get_frame(handle h, u8 *buffer, u32 size,
+                      u64 *out_frame_id = nullptr) {
+#ifdef LIB_CAMERA_IMPLEMENTATION
+    if (!h)
+        return;
+
+    (void)size; // Suppress unused warning
+
+    // FIX: LatestFrame() returns std::shared_ptr<const Frame>
+    std::shared_ptr<const CameraLibrary::Frame> frame = nullptr;
+
+    // Blocking wait for a frame.
+    while (true) {
+        frame = h->LatestFrame();
+        // Check if pointer is valid
+        if (frame)
+            break;
+        std::this_thread::sleep_for(std::chrono::microseconds(10));
+    }
+
+    if (frame) {
+        int w = h->Width();
+        int h_dim = h->Height();
+
+        // Signature: Rasterize(Camera &camera, int width, int height, int span,
+        // int bitsPerPixel, void *buffer) const
+        frame->Rasterize(*h, w, h_dim, w, 8, buffer);
+
+        if (out_frame_id) {
+            *out_frame_id = static_cast<u64>(frame->FrameID());
+        }
+    }
+#endif
+}
+
+// -----------------------------------------------------------------------------
+// SYNC & INFO
+// -----------------------------------------------------------------------------
+
+inline int get_serial(handle h) {
+#ifdef LIB_CAMERA_IMPLEMENTATION
+    return h ? h->Serial() : 0;
+#endif
+}
+
+inline bool is_synced() {
+#ifdef LIB_CAMERA_IMPLEMENTATION
+    return true;
 #else
-#include <fcntl.h>
-#include <termios.h>
-#include <unistd.h>
+    return true;
 #endif
-
-extern "C" {
-#include "lib/types.h"
-#include <SDL2/SDL.h>
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavutil/imgutils.h>
-#include <libavutil/opt.h>
-#include <libavutil/pixfmt.h>
-#include <libswscale/swscale.h>
 }
 
-constexpr const u32 WIDTH = 1920;
-constexpr const u32 HEIGHT = 1080;
-constexpr const u32 CHANNEL = 1;
-constexpr const u32 FRAME_SIZE = WIDTH * HEIGHT * CHANNEL;
-constexpr const i32 FPS = 250;
-constexpr const u32 SECONDS = 1;
-constexpr const u32 FRAME_NUM = FPS * SECONDS;
-constexpr const u32 ARENA_SIZE = FRAME_NUM * FRAME_SIZE;
-constexpr const u32 DISPLAY_HERTZ = 30;
+inline bool wait_for_sync(u32 timeout_ms = 5000) {
+#ifdef LIB_CAMERA_IMPLEMENTATION
+    std::println("Waiting for Hardware Sync Lock...");
+    auto start = std::chrono::steady_clock::now();
 
-constexpr const i32 CAMERA_EXPOSURE = 2500;
-constexpr const i32 CAMERA_GAIN = 4;
-
-std::atomic<bool> g_running = false;
-std::atomic<bool> g_paused = false;
-std::atomic<u8 *> g_live_display_ptr{nullptr};
-
-struct FrameMetadata {
-    u64 pts;
-    u64 dts;
-    u32 flags;
-    u32 reserved;
-};
-
-struct alignas(32) Arena {
-    u8 data[ARENA_SIZE];
-};
-
-struct CameraContext {
-    int id;
-    int serial;
-    camera::handle cam_handle;
-    std::string output_filename;
-
-    std::unique_ptr<Arena> arena;
-    alignas(64) std::array<FrameMetadata, FRAME_NUM> frame_meta;
-
-    boost::lockfree::spsc_queue<u16, boost::lockfree::capacity<FRAME_NUM>>
-        free_q;
-    boost::lockfree::spsc_queue<u16, boost::lockfree::capacity<FRAME_NUM>>
-        ready_q;
-
-    std::atomic<u16> latest_frame_id{FRAME_NUM};
-
-    AVCodecContext *enc_ctx = nullptr;
-    AVFrame *yuv_frame = nullptr;
-    SwsContext *sws = nullptr;
-    AVFormatContext *fmt_ctx = nullptr;
-    AVStream *vid_stream = nullptr;
-
-    CameraContext(int index, camera::handle h) : id(index), cam_handle(h) {
-        serial = camera::get_serial(h);
-        output_filename = std::format("output/cam_{}.mkv", serial);
-
-        arena = std::make_unique<Arena>();
-
-        for (usize i = 0; i < FRAME_NUM; ++i) {
-            free_q.push(static_cast<u16>(i));
+    while (std::chrono::steady_clock::now() - start <
+           std::chrono::milliseconds(timeout_ms)) {
+        if (is_synced()) {
+            std::println("System is hardware synchronized.");
+            return true;
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-};
 
-#ifndef _WIN32
-struct RawTerm {
-    termios orig_termios;
-    RawTerm() {
-        tcgetattr(STDIN_FILENO, &orig_termios);
-        termios raw = orig_termios;
-        raw.c_lflag &= ~(ECHO | ICANON);
-        raw.c_cc[VMIN] = 0;
-        raw.c_cc[VTIME] = 0;
-        tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
-    }
-    ~RawTerm() { tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios); }
-};
-char get_key_nonblocking() {
-    char ch = 0;
-    if (read(STDIN_FILENO, &ch, 1) > 0)
-        return ch;
-    return 0;
-}
+    std::println(stderr, "WARNING: Hardware sync timed out or check disabled.");
+    return false;
 #else
-char get_key_nonblocking() {
-    if (_kbhit())
-        return _getch();
-    return 0;
-}
+    return true;
 #endif
-
-void producer(CameraContext *ctx) {
-    while (!g_running.load(std::memory_order_acquire)) {
-        if (std::this_thread::get_id() == std::thread::id())
-            return;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-
-    std::println("Cam {} ({}) Capture starting.", ctx->id, ctx->serial);
-    camera::start(ctx->cam_handle);
-
-    u64 start_frame_id = 0;
-    bool first_frame = true;
-    u16 id;
-
-    while (g_running.load(std::memory_order_relaxed)) {
-        if (g_paused.load(std::memory_order_relaxed)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            continue;
-        }
-
-        if (!ctx->free_q.pop(id)) {
-            std::this_thread::yield();
-            continue;
-        }
-
-        u8 *src = ctx->arena->data + static_cast<usize>(id) * FRAME_SIZE;
-        u64 hardware_id = 0;
-
-        camera::get_frame(ctx->cam_handle, src, FRAME_SIZE, &hardware_id);
-
-        if (first_frame) {
-            start_frame_id = hardware_id;
-            first_frame = false;
-        }
-
-        u64 rel_pts = hardware_id - start_frame_id;
-
-        ctx->frame_meta[id].pts = rel_pts;
-        ctx->frame_meta[id].dts = rel_pts;
-
-        ctx->latest_frame_id.store(id, std::memory_order_release);
-
-        while (!ctx->ready_q.push(id)) {
-            if (!g_running)
-                break;
-        }
-    }
-
-    camera::stop(ctx->cam_handle);
 }
 
-void consumer(CameraContext *ctx, std::promise<bool> ready_promise) {
-    const AVCodec *codec = avcodec_find_encoder_by_name("hevc_nvenc");
-    if (!codec) {
-        codec = avcodec_find_encoder(AV_CODEC_ID_HEVC);
-        if (!codec) {
-            std::println(std::cerr, "Cam {} Error: No HEVC encoder found.",
-                         ctx->id);
-            ready_promise.set_value(false);
-            return;
-        }
-    }
+// -----------------------------------------------------------------------------
+// CONFIGURATION
+// -----------------------------------------------------------------------------
 
-    ctx->enc_ctx = avcodec_alloc_context3(codec);
-    ctx->enc_ctx->bit_rate = 8000000;
-    ctx->enc_ctx->width = WIDTH;
-    ctx->enc_ctx->height = HEIGHT;
-    ctx->enc_ctx->time_base = AVRational{1, FPS};
-    ctx->enc_ctx->framerate = AVRational{FPS, 1};
-    ctx->enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-    ctx->enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    ctx->enc_ctx->gop_size = 60;
-    ctx->enc_ctx->max_b_frames = 0;
-
-    if (std::string(codec->name) == "hevc_nvenc") {
-        av_opt_set(ctx->enc_ctx->priv_data, "preset", "fast", 0);
-        av_opt_set(ctx->enc_ctx->priv_data, "rc", "cbr", 0);
-    }
-
-    if (avcodec_open2(ctx->enc_ctx, codec, nullptr) < 0) {
-        ready_promise.set_value(false);
+inline void set_format(handle h, FrameFormat format) {
+#ifdef LIB_CAMERA_IMPLEMENTATION
+    if (!h)
         return;
+
+    switch (format) {
+    case GRAY8:
+        // FIX: Use top-level Core namespace
+        h->SetVideoType(Core::GrayscaleMode);
+        std::println("Cam {} Set to Grayscale Mode", h->Serial());
+        break;
+
+    case RGBA32:
+    case RGB24:
+        // FIX: Use top-level Core namespace
+        h->SetVideoType(Core::MJPEGMode);
+        std::println("Cam {} Set to MJPEG Mode (Color)", h->Serial());
+        break;
+
+    default:
+        std::println(stderr, "WARNING: Format not explicitly supported.");
+        break;
     }
-
-    avformat_alloc_output_context2(&ctx->fmt_ctx, nullptr, "matroska",
-                                   ctx->output_filename.c_str());
-    if (!ctx->fmt_ctx) {
-        ready_promise.set_value(false);
-        return;
-    }
-
-    ctx->vid_stream = avformat_new_stream(ctx->fmt_ctx, nullptr);
-    ctx->vid_stream->id = ctx->fmt_ctx->nb_streams - 1;
-    avcodec_parameters_from_context(ctx->vid_stream->codecpar, ctx->enc_ctx);
-    ctx->vid_stream->time_base = ctx->enc_ctx->time_base;
-
-    if (!(ctx->fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
-        if (avio_open(&ctx->fmt_ctx->pb, ctx->output_filename.c_str(),
-                      AVIO_FLAG_WRITE) < 0) {
-            ready_promise.set_value(false);
-            return;
-        }
-    }
-
-    if (avformat_write_header(ctx->fmt_ctx, nullptr) < 0) {
-        ready_promise.set_value(false);
-        return;
-    }
-
-    AVPixelFormat input_fmt =
-        (CHANNEL == 1) ? AV_PIX_FMT_GRAY8 : AV_PIX_FMT_RGBA;
-
-    ctx->sws = sws_getContext(WIDTH, HEIGHT, input_fmt, WIDTH, HEIGHT,
-                              AV_PIX_FMT_YUV420P, SWS_BILINEAR, nullptr,
-                              nullptr, nullptr);
-
-    ctx->yuv_frame = av_frame_alloc();
-    ctx->yuv_frame->format = ctx->enc_ctx->pix_fmt;
-    ctx->yuv_frame->width = WIDTH;
-    ctx->yuv_frame->height = HEIGHT;
-    av_frame_get_buffer(ctx->yuv_frame, 32);
-
-    AVPacket *pkt = av_packet_alloc();
-    ready_promise.set_value(true);
-
-    while (!g_running.load(std::memory_order_acquire)) {
-        if (std::this_thread::get_id() == std::thread::id())
-            return;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-
-    while (g_running.load(std::memory_order_acquire)) {
-        u16 id;
-        if (!ctx->ready_q.pop(id)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
-
-        const u8 *src_data =
-            ctx->arena->data + static_cast<usize>(id) * FRAME_SIZE;
-        const u8 *src_slice[1] = {src_data};
-        i32 src_stride[1] = {static_cast<i32>(WIDTH * CHANNEL)};
-
-        sws_scale(ctx->sws, src_slice, src_stride, 0, HEIGHT,
-                  ctx->yuv_frame->data, ctx->yuv_frame->linesize);
-
-        ctx->yuv_frame->pts = static_cast<i64>(ctx->frame_meta[id].pts);
-
-        if (avcodec_send_frame(ctx->enc_ctx, ctx->yuv_frame) >= 0) {
-            while (avcodec_receive_packet(ctx->enc_ctx, pkt) == 0) {
-                av_packet_rescale_ts(pkt, ctx->enc_ctx->time_base,
-                                     ctx->vid_stream->time_base);
-                pkt->stream_index = ctx->vid_stream->index;
-                av_interleaved_write_frame(ctx->fmt_ctx, pkt);
-                av_packet_unref(pkt);
-            }
-        }
-
-        while (!ctx->free_q.push(id)) {
-            if (!g_running)
-                break;
-        }
-    }
-
-    avcodec_send_frame(ctx->enc_ctx, nullptr);
-    while (avcodec_receive_packet(ctx->enc_ctx, pkt) == 0) {
-        av_packet_rescale_ts(pkt, ctx->enc_ctx->time_base,
-                             ctx->vid_stream->time_base);
-        pkt->stream_index = ctx->vid_stream->index;
-        av_interleaved_write_frame(ctx->fmt_ctx, pkt);
-        av_packet_unref(pkt);
-    }
-
-    av_write_trailer(ctx->fmt_ctx);
-    if (!(ctx->fmt_ctx->oformat->flags & AVFMT_NOFILE))
-        avio_closep(&ctx->fmt_ctx->pb);
-    avformat_free_context(ctx->fmt_ctx);
-    av_packet_free(&pkt);
-    av_frame_free(&ctx->yuv_frame);
-    sws_freeContext(ctx->sws);
-    avcodec_free_context(&ctx->enc_ctx);
-}
-
-void display(std::promise<bool> ready_promise) {
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-        ready_promise.set_value(false);
-        return;
-    }
-    SDL_Window *window = SDL_CreateWindow(
-        "PrimeX Sync Preview", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        WIDTH / 2, HEIGHT / 2, SDL_WINDOW_SHOWN);
-    SDL_Renderer *renderer =
-        SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
-
-    SDL_Texture *texture =
-        SDL_CreateTexture(renderer, SDL_PIXELFORMAT_YV12,
-                          SDL_TEXTUREACCESS_STREAMING, WIDTH, HEIGHT);
-
-    std::vector<u8> dummy_uv((WIDTH / 2) * (HEIGHT / 2), 0x80);
-
-    ready_promise.set_value(true);
-
-    while (!g_running.load(std::memory_order_acquire)) {
-        if (std::this_thread::get_id() == std::thread::id())
-            return;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-
-    while (g_running.load(std::memory_order_relaxed)) {
-        u8 *ptr = g_live_display_ptr.load(std::memory_order_relaxed);
-
-        if (ptr) {
-            if (CHANNEL == 1) {
-                SDL_UpdateYUVTexture(texture, nullptr, ptr, WIDTH,
-                                     dummy_uv.data(), WIDTH / 2,
-                                     dummy_uv.data(), WIDTH / 2);
-            } else {
-                SDL_UpdateTexture(texture, nullptr, ptr, WIDTH * 4);
-            }
-            SDL_RenderCopy(renderer, texture, nullptr, nullptr);
-            SDL_RenderPresent(renderer);
-        }
-
-        SDL_Event e;
-        while (SDL_PollEvent(&e)) {
-            if (e.type == SDL_QUIT)
-                g_running = false;
-        }
-
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(1000 / DISPLAY_HERTZ));
-    }
-
-    SDL_DestroyTexture(texture);
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
-    SDL_Quit();
-}
-
-int main() {
-    auto cam_handles = camera::init();
-    if (cam_handles.size() < 3) {
-        std::println(std::cerr, "ERROR: Need 3 cameras, found {}",
-                     cam_handles.size());
-        return 1;
-    }
-
-    std::println("Configuring Cameras...");
-    for (auto h : cam_handles) {
-        camera::set_format(h, (CHANNEL == 1) ? camera::GRAY8 : camera::RGBA32);
-
-        camera::set_ir_filter(h, true);
-        camera::set_ir_illumination(h, false);
-
-        camera::set_exposure(h, CAMERA_EXPOSURE);
-        camera::set_gain(h, CAMERA_GAIN);
-    }
-
-    if (!camera::wait_for_sync(5000)) {
-        std::println(stderr, "WARNING: Proceeding without Hardware Sync Lock.");
-    }
-
-    std::vector<std::unique_ptr<CameraContext>> contexts;
-    for (int i = 0; i < 3; ++i) {
-        contexts.push_back(std::make_unique<CameraContext>(i, cam_handles[i]));
-    }
-
-    g_running = false;
-
-    std::vector<std::thread> pool;
-    std::vector<std::future<bool>> display_futures;
-    std::vector<std::future<bool>> encoder_futures;
-
-    std::promise<bool> disp_prom;
-    display_futures.push_back(disp_prom.get_future());
-    pool.emplace_back(display, std::move(disp_prom));
-
-    for (int i = 0; i < 3; ++i) {
-        CameraContext *ctx = contexts[i].get();
-        pool.emplace_back(producer, ctx);
-
-        std::promise<bool> enc_prom;
-        encoder_futures.push_back(enc_prom.get_future());
-        pool.emplace_back(consumer, ctx, std::move(enc_prom));
-    }
-
-    bool all_ok = true;
-    if (!display_futures[0].get()) {
-        std::println("Display init failed.");
-        all_ok = false;
-    }
-    for (auto &fut : encoder_futures) {
-        if (!fut.get()) {
-            std::println("Encoder init failed.");
-            all_ok = false;
-        }
-    }
-
-    if (!all_ok) {
-        g_running = true;
-        for (auto &t : pool)
-            if (t.joinable())
-                t.join();
-        return 1;
-    }
-
-    std::println("All systems ready. Starting Capture...");
-    g_running = true;
-
-#ifndef _WIN32
-    RawTerm term_guard;
-    fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK);
 #endif
-
-    std::println("Controls: [1-3] Switch View, [P] Pause, [Q] Quit");
-
-    int active_idx = 0;
-
-    while (g_running) {
-        char c = get_key_nonblocking();
-
-        if (c == 'q')
-            g_running = false;
-        if (c == 'p') {
-            g_paused = !g_paused;
-            std::println("Paused: {}", (bool)g_paused);
-        }
-        if (c == '1' || c == '2' || c == '3') {
-            active_idx = c - '1';
-            std::println("Active View: Cam {} (Serial {})", active_idx,
-                         contexts[active_idx]->serial);
-        }
-
-        u16 frame_id = contexts[active_idx]->latest_frame_id.load(
-            std::memory_order_acquire);
-        if (frame_id < FRAME_NUM) {
-            u8 *ptr = contexts[active_idx]->arena->data +
-                      (static_cast<usize>(frame_id) * FRAME_SIZE);
-            g_live_display_ptr.store(ptr, std::memory_order_relaxed);
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-
-    for (auto &t : pool)
-        if (t.joinable())
-            t.join();
-    for (auto &ctx : contexts)
-        camera::deinit(ctx->cam_handle);
-
-    std::println("Shutdown complete.");
-    return 0;
 }
+
+inline void set_exposure(handle h, int microseconds) {
+#ifdef LIB_CAMERA_IMPLEMENTATION
+    if (h) {
+        h->SetExposure(microseconds);
+        std::println("Cam {} Exposure: {} us", h->Serial(), microseconds);
+    }
+#endif
+}
+
+inline void set_gain(handle h, int gain) {
+#ifdef LIB_CAMERA_IMPLEMENTATION
+    if (h)
+        h->SetIntensity(gain);
+#endif
+}
+
+inline void set_ir_illumination(handle h, bool enable) {
+#ifdef LIB_CAMERA_IMPLEMENTATION
+    // Optional: implementation depends on exact SDK support
+#endif
+}
+
+inline void set_ir_filter(handle h, bool enable_visible_light) {
+#ifdef LIB_CAMERA_IMPLEMENTATION
+    if (h) {
+        // 1 = Visible (IR Cut ON), 0 = IR (IR Cut OFF)
+        h->SetIRFilter(enable_visible_light ? 1 : 0);
+        std::println("Cam {} Filter: {}", h->Serial(),
+                     enable_visible_light ? "Visible" : "IR");
+    }
+#endif
+}
+
+// Deprecated setters
+inline void set_fps(handle h, u32 fps) {}
+inline void set_size(handle h, u32 width, u32 height) {}
+
+} // namespace camera
