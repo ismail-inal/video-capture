@@ -1,5 +1,6 @@
 #define LIB_CAMERA_IMPLEMENTATION
 #include "lib/camera.hpp"
+
 #include <array>
 #include <atomic>
 #include <boost/lockfree/spsc_queue.hpp>
@@ -8,6 +9,7 @@
 #include <memory>
 #include <print>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #include <conio.h>
@@ -21,6 +23,7 @@ extern "C" {
 #include "lib/types.h"
 #include <SDL2/SDL.h>
 #include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixfmt.h>
@@ -31,14 +34,18 @@ constexpr const u32 WIDTH = 1920;
 constexpr const u32 HEIGHT = 1080;
 constexpr const u32 CHANNEL = 1;
 constexpr const u32 FRAME_SIZE = WIDTH * HEIGHT * CHANNEL;
-
 constexpr const i32 FPS = 250;
 constexpr const u32 SECONDS = 1;
 constexpr const u32 FRAME_NUM = FPS * SECONDS;
 constexpr const u32 ARENA_SIZE = FRAME_NUM * FRAME_SIZE;
-constexpr const char *OUTFILE = "output/out.h265";
-
 constexpr const u32 DISPLAY_HERTZ = 30;
+
+constexpr const i32 CAMERA_EXPOSURE = 2500;
+constexpr const i32 CAMERA_GAIN = 4;
+
+std::atomic<bool> g_running = false;
+std::atomic<bool> g_paused = false;
+std::atomic<u8 *> g_live_display_ptr{nullptr};
 
 struct FrameMetadata {
     u64 pts;
@@ -51,9 +58,39 @@ struct alignas(32) Arena {
     u8 data[ARENA_SIZE];
 };
 
-std::atomic<bool> running = false;
-std::atomic<bool> paused = false;
-std::atomic<u16> g_latest_display_frame_id{FRAME_NUM};
+struct CameraContext {
+    int id;
+    int serial;
+    camera::handle cam_handle;
+    std::string output_filename;
+
+    std::unique_ptr<Arena> arena;
+    alignas(64) std::array<FrameMetadata, FRAME_NUM> frame_meta;
+
+    boost::lockfree::spsc_queue<u16, boost::lockfree::capacity<FRAME_NUM>>
+        free_q;
+    boost::lockfree::spsc_queue<u16, boost::lockfree::capacity<FRAME_NUM>>
+        ready_q;
+
+    std::atomic<u16> latest_frame_id{FRAME_NUM};
+
+    AVCodecContext *enc_ctx = nullptr;
+    AVFrame *yuv_frame = nullptr;
+    SwsContext *sws = nullptr;
+    AVFormatContext *fmt_ctx = nullptr;
+    AVStream *vid_stream = nullptr;
+
+    CameraContext(int index, camera::handle h) : id(index), cam_handle(h) {
+        serial = camera::get_serial(h);
+        output_filename = std::format("output/cam_{}.mkv", serial);
+
+        arena = std::make_unique<Arena>();
+
+        for (usize i = 0; i < FRAME_NUM; ++i) {
+            free_q.push(static_cast<u16>(i));
+        }
+    }
+};
 
 #ifndef _WIN32
 struct RawTerm {
@@ -68,364 +105,370 @@ struct RawTerm {
     }
     ~RawTerm() { tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios); }
 };
+char get_key_nonblocking() {
+    char ch = 0;
+    if (read(STDIN_FILENO, &ch, 1) > 0)
+        return ch;
+    return 0;
+}
+#else
+char get_key_nonblocking() {
+    if (_kbhit())
+        return _getch();
+    return 0;
+}
 #endif
 
-int main() {
-    auto arena = std::make_unique<Arena>();
-    alignas(64) static std::array<FrameMetadata, FRAME_NUM> frame_meta;
-
-    namespace blf = boost::lockfree;
-    blf::spsc_queue<u16, blf::capacity<FRAME_NUM>> free_q;
-    blf::spsc_queue<u16, blf::capacity<FRAME_NUM>> ready_q;
-
-    for (usize i = 0; i < FRAME_NUM; ++i) {
-        free_q.push(static_cast<u16>(i));
+void producer(CameraContext *ctx) {
+    while (!g_running.load(std::memory_order_acquire)) {
+        if (std::this_thread::get_id() == std::thread::id())
+            return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    camera::handle camera_handle = camera::init()[0];
-    camera::set_size(camera_handle, WIDTH, HEIGHT);
-    camera::set_format(camera_handle, camera::GRAY8);
-    camera::set_fps(camera_handle, FPS);
+    std::println("Cam {} ({}) Capture starting.", ctx->id, ctx->serial);
+    camera::start(ctx->cam_handle);
 
-    std::promise<bool> consumer_ready_promise;
-    std::promise<bool> display_ready_promise;
-    std::future<bool> consumer_ready_future =
-        consumer_ready_promise.get_future();
-    std::future<bool> display_ready_future = display_ready_promise.get_future();
+    u64 start_frame_id = 0;
+    bool first_frame = true;
+    u16 id;
 
-    std::thread producer([&]() {
-        while (!running.load(std::memory_order_acquire)) {
-            if (std::this_thread::get_id() == std::thread::id())
-                return;
+    while (g_running.load(std::memory_order_relaxed)) {
+        if (g_paused.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
         }
-        std::println("Producer thread starting capture.");
 
-        u64 pts_counter = 0;
-        u16 id;
-        u8 *src = nullptr;
-        while (running) {
-            if (paused) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
-            }
-
-            if (!free_q.pop(id)) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                continue;
-            }
-
-            src = arena->data + static_cast<usize>(id) * FRAME_SIZE;
-            camera::get_frame(camera_handle, src, FRAME_SIZE);
-
-            frame_meta[id].pts = pts_counter;
-            frame_meta[id].dts = pts_counter;
-            frame_meta[id].flags = 0;
-
-            while (!ready_q.push(id)) {
-                if (!running)
-                    break;
-            }
-
-            ++pts_counter;
+        if (!ctx->free_q.pop(id)) {
+            std::this_thread::yield();
+            continue;
         }
-    });
 
-    std::thread consumer([&, ready_promise =
-                                 std::move(consumer_ready_promise)]() mutable {
-        const AVCodec *codec = avcodec_find_encoder_by_name("hevc_nvenc");
+        u8 *src = ctx->arena->data + static_cast<usize>(id) * FRAME_SIZE;
+        u64 hardware_id = 0;
+
+        camera::get_frame(ctx->cam_handle, src, FRAME_SIZE, &hardware_id);
+
+        if (first_frame) {
+            start_frame_id = hardware_id;
+            first_frame = false;
+        }
+
+        u64 rel_pts = hardware_id - start_frame_id;
+
+        ctx->frame_meta[id].pts = rel_pts;
+        ctx->frame_meta[id].dts = rel_pts;
+
+        ctx->latest_frame_id.store(id, std::memory_order_release);
+
+        while (!ctx->ready_q.push(id)) {
+            if (!g_running)
+                break;
+        }
+    }
+
+    camera::stop(ctx->cam_handle);
+}
+
+void consumer(CameraContext *ctx, std::promise<bool> ready_promise) {
+    const AVCodec *codec = avcodec_find_encoder_by_name("hevc_nvenc");
+    if (!codec) {
+        codec = avcodec_find_encoder(AV_CODEC_ID_HEVC);
         if (!codec) {
-            std::println(std::cerr,
-                         "ERROR: NVENC encoder 'hevc_nvenc' not found.");
+            std::println(std::cerr, "Cam {} Error: No HEVC encoder found.",
+                         ctx->id);
             ready_promise.set_value(false);
             return;
         }
+    }
 
-        AVCodecContext *enc_ctx = avcodec_alloc_context3(codec);
-        if (!enc_ctx) {
-            std::println(std::cerr, "ERROR: avcodec_alloc_context3 failed");
+    ctx->enc_ctx = avcodec_alloc_context3(codec);
+    ctx->enc_ctx->bit_rate = 8000000;
+    ctx->enc_ctx->width = WIDTH;
+    ctx->enc_ctx->height = HEIGHT;
+    ctx->enc_ctx->time_base = AVRational{1, FPS};
+    ctx->enc_ctx->framerate = AVRational{FPS, 1};
+    ctx->enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    ctx->enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    ctx->enc_ctx->gop_size = 60;
+    ctx->enc_ctx->max_b_frames = 0;
+
+    if (std::string(codec->name) == "hevc_nvenc") {
+        av_opt_set(ctx->enc_ctx->priv_data, "preset", "fast", 0);
+        av_opt_set(ctx->enc_ctx->priv_data, "rc", "cbr", 0);
+    }
+
+    if (avcodec_open2(ctx->enc_ctx, codec, nullptr) < 0) {
+        ready_promise.set_value(false);
+        return;
+    }
+
+    avformat_alloc_output_context2(&ctx->fmt_ctx, nullptr, "matroska",
+                                   ctx->output_filename.c_str());
+    if (!ctx->fmt_ctx) {
+        ready_promise.set_value(false);
+        return;
+    }
+
+    ctx->vid_stream = avformat_new_stream(ctx->fmt_ctx, nullptr);
+    ctx->vid_stream->id = ctx->fmt_ctx->nb_streams - 1;
+    avcodec_parameters_from_context(ctx->vid_stream->codecpar, ctx->enc_ctx);
+    ctx->vid_stream->time_base = ctx->enc_ctx->time_base;
+
+    if (!(ctx->fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
+        if (avio_open(&ctx->fmt_ctx->pb, ctx->output_filename.c_str(),
+                      AVIO_FLAG_WRITE) < 0) {
             ready_promise.set_value(false);
             return;
         }
+    }
 
-        enc_ctx->bit_rate = 8000000;
-        enc_ctx->width = WIDTH;
-        enc_ctx->height = HEIGHT;
-        enc_ctx->time_base = AVRational{1, FPS};
-        enc_ctx->framerate = AVRational{FPS, 1};
-        enc_ctx->gop_size = 60;
-        enc_ctx->max_b_frames = 0;
-        enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    if (avformat_write_header(ctx->fmt_ctx, nullptr) < 0) {
+        ready_promise.set_value(false);
+        return;
+    }
 
-        av_opt_set(enc_ctx->priv_data, "preset", "fast", 0);
-        av_opt_set(enc_ctx->priv_data, "rc", "cbr", 0);
-        av_opt_set(enc_ctx->priv_data, "profile", "main", 0);
-        av_opt_set(enc_ctx->priv_data, "annexb", "1", 0);
+    AVPixelFormat input_fmt =
+        (CHANNEL == 1) ? AV_PIX_FMT_GRAY8 : AV_PIX_FMT_RGBA;
 
-        if (avcodec_open2(enc_ctx, codec, nullptr) < 0) {
-            std::println(std::cerr, "ERROR: Could not open encoder");
-            avcodec_free_context(&enc_ctx);
-            ready_promise.set_value(false);
+    ctx->sws = sws_getContext(WIDTH, HEIGHT, input_fmt, WIDTH, HEIGHT,
+                              AV_PIX_FMT_YUV420P, SWS_BILINEAR, nullptr,
+                              nullptr, nullptr);
+
+    ctx->yuv_frame = av_frame_alloc();
+    ctx->yuv_frame->format = ctx->enc_ctx->pix_fmt;
+    ctx->yuv_frame->width = WIDTH;
+    ctx->yuv_frame->height = HEIGHT;
+    av_frame_get_buffer(ctx->yuv_frame, 32);
+
+    AVPacket *pkt = av_packet_alloc();
+    ready_promise.set_value(true);
+
+    while (!g_running.load(std::memory_order_acquire)) {
+        if (std::this_thread::get_id() == std::thread::id())
             return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    while (g_running.load(std::memory_order_acquire)) {
+        u16 id;
+        if (!ctx->ready_q.pop(id)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
         }
 
-        SwsContext *sws = sws_getContext(
-            WIDTH, HEIGHT, AV_PIX_FMT_GRAY8, WIDTH, HEIGHT, AV_PIX_FMT_YUV420P,
-            SWS_BILINEAR, nullptr, nullptr, nullptr);
+        const u8 *src_data =
+            ctx->arena->data + static_cast<usize>(id) * FRAME_SIZE;
+        const u8 *src_slice[1] = {src_data};
+        i32 src_stride[1] = {static_cast<i32>(WIDTH * CHANNEL)};
 
-        if (!sws) {
-            std::println(std::cerr, "ERROR: sws_getContext failed");
-            avcodec_free_context(&enc_ctx);
-            ready_promise.set_value(false);
-            return;
-        }
+        sws_scale(ctx->sws, src_slice, src_stride, 0, HEIGHT,
+                  ctx->yuv_frame->data, ctx->yuv_frame->linesize);
 
-        AVFrame *yuv_frame = av_frame_alloc();
-        if (!yuv_frame) {
-            std::println(std::cerr, "ERROR: av_frame_alloc failed");
-            sws_freeContext(sws);
-            avcodec_free_context(&enc_ctx);
-            ready_promise.set_value(false);
-            return;
-        }
-        yuv_frame->format = enc_ctx->pix_fmt;
-        yuv_frame->width = enc_ctx->width;
-        yuv_frame->height = enc_ctx->height;
-        if (av_frame_get_buffer(yuv_frame, 32) < 0) {
-            std::println(std::cerr, "ERROR: av_frame_get_buffer failed");
-            av_frame_free(&yuv_frame);
-            sws_freeContext(sws);
-            avcodec_free_context(&enc_ctx);
-            ready_promise.set_value(false);
-            return;
-        }
+        ctx->yuv_frame->pts = static_cast<i64>(ctx->frame_meta[id].pts);
 
-        AVPacket *pkt = av_packet_alloc();
-        if (!pkt) {
-            std::println(std::cerr, "ERROR: av_packet_alloc failed");
-            av_frame_free(&yuv_frame);
-            sws_freeContext(sws);
-            avcodec_free_context(&enc_ctx);
-            ready_promise.set_value(false);
-            return;
-        }
-
-        FILE *f = std::fopen(OUTFILE, "wb");
-        if (!f) {
-            std::println(std::cerr, "ERROR: Could not open output file '{}'",
-                         OUTFILE);
-            av_packet_free(&pkt);
-            av_frame_free(&yuv_frame);
-            sws_freeContext(sws);
-            avcodec_free_context(&enc_ctx);
-            ready_promise.set_value(false);
-            return;
-        }
-
-        std::println("Consumer thread initialized successfully.");
-        ready_promise.set_value(true);
-
-        while (!running.load(std::memory_order_acquire)) {
-            if (std::this_thread::get_id() == std::thread::id())
-                return;
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-
-        while (running) {
-            u16 id;
-            if (!ready_q.pop(id)) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                continue;
-            }
-
-            g_latest_display_frame_id.store(id, std::memory_order_release);
-
-            const FrameMetadata meta = frame_meta[id];
-            const u8 *src_rgb =
-                arena->data + static_cast<usize>(id) * FRAME_SIZE;
-
-            const u8 *src_slice[1] = {src_rgb};
-            i32 src_stride[1] = {static_cast<i32>(WIDTH * CHANNEL)};
-
-            sws_scale(sws, src_slice, src_stride, 0, HEIGHT, yuv_frame->data,
-                      yuv_frame->linesize);
-
-            yuv_frame->pts = static_cast<i64>(meta.pts);
-
-            if (avcodec_send_frame(enc_ctx, yuv_frame) < 0) {
-                std::println(std::cerr,
-                             "WARNING: avcodec_send_frame failed for pts={}",
-                             meta.pts);
-            } else {
-                while (avcodec_receive_packet(enc_ctx, pkt) == 0) {
-                    std::fwrite(pkt->data, 1, pkt->size, f);
-                    av_packet_unref(pkt);
-                }
-            }
-
-            while (!free_q.push(id)) {
-                if (!running)
-                    break;
+        if (avcodec_send_frame(ctx->enc_ctx, ctx->yuv_frame) >= 0) {
+            while (avcodec_receive_packet(ctx->enc_ctx, pkt) == 0) {
+                av_packet_rescale_ts(pkt, ctx->enc_ctx->time_base,
+                                     ctx->vid_stream->time_base);
+                pkt->stream_index = ctx->vid_stream->index;
+                av_interleaved_write_frame(ctx->fmt_ctx, pkt);
+                av_packet_unref(pkt);
             }
         }
 
-        avcodec_send_frame(enc_ctx, nullptr);
-        while (avcodec_receive_packet(enc_ctx, pkt) == 0) {
-            std::fwrite(pkt->data, 1, pkt->size, f);
-            av_packet_unref(pkt);
+        while (!ctx->free_q.push(id)) {
+            if (!g_running)
+                break;
         }
+    }
 
-        std::fclose(f);
-        av_packet_free(&pkt);
-        av_frame_free(&yuv_frame);
-        sws_freeContext(sws);
-        avcodec_free_context(&enc_ctx);
-    });
+    avcodec_send_frame(ctx->enc_ctx, nullptr);
+    while (avcodec_receive_packet(ctx->enc_ctx, pkt) == 0) {
+        av_packet_rescale_ts(pkt, ctx->enc_ctx->time_base,
+                             ctx->vid_stream->time_base);
+        pkt->stream_index = ctx->vid_stream->index;
+        av_interleaved_write_frame(ctx->fmt_ctx, pkt);
+        av_packet_unref(pkt);
+    }
 
-    std::thread display([&, ready_promise =
-                                std::move(display_ready_promise)]() mutable {
-        if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-            std::println(std::cerr, "SDL could not initialize! SDL_Error: {}",
-                         SDL_GetError());
-            ready_promise.set_value(false);
+    av_write_trailer(ctx->fmt_ctx);
+    if (!(ctx->fmt_ctx->oformat->flags & AVFMT_NOFILE))
+        avio_closep(&ctx->fmt_ctx->pb);
+    avformat_free_context(ctx->fmt_ctx);
+    av_packet_free(&pkt);
+    av_frame_free(&ctx->yuv_frame);
+    sws_freeContext(ctx->sws);
+    avcodec_free_context(&ctx->enc_ctx);
+}
+
+void display(std::promise<bool> ready_promise) {
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+        ready_promise.set_value(false);
+        return;
+    }
+    SDL_Window *window = SDL_CreateWindow(
+        "PrimeX Sync Preview", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        WIDTH / 2, HEIGHT / 2, SDL_WINDOW_SHOWN);
+    SDL_Renderer *renderer =
+        SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+
+    SDL_Texture *texture =
+        SDL_CreateTexture(renderer, SDL_PIXELFORMAT_YV12,
+                          SDL_TEXTUREACCESS_STREAMING, WIDTH, HEIGHT);
+
+    std::vector<u8> dummy_uv((WIDTH / 2) * (HEIGHT / 2), 0x80);
+
+    ready_promise.set_value(true);
+
+    while (!g_running.load(std::memory_order_acquire)) {
+        if (std::this_thread::get_id() == std::thread::id())
             return;
-        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
 
-        SDL_Window *window = SDL_CreateWindow(
-            "Live Preview", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-            WIDTH / 2, HEIGHT / 2, SDL_WINDOW_SHOWN);
-        if (!window) {
-            std::println(std::cerr,
-                         "Window could not be created! SDL_Error: {}",
-                         SDL_GetError());
-            SDL_Quit();
-            ready_promise.set_value(false);
-            return;
-        }
+    while (g_running.load(std::memory_order_relaxed)) {
+        u8 *ptr = g_live_display_ptr.load(std::memory_order_relaxed);
 
-        SDL_Renderer *renderer =
-            SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
-        if (!renderer) {
-            std::println(std::cerr,
-                         "Renderer could not be created! SDL Error: {}",
-                         SDL_GetError());
-            SDL_DestroyWindow(window);
-            SDL_Quit();
-            ready_promise.set_value(false);
-            return;
-        }
-
-        SDL_Texture *texture =
-            SDL_CreateTexture(renderer, SDL_PIXELFORMAT_YV12,
-                              SDL_TEXTUREACCESS_STREAMING, WIDTH, HEIGHT);
-        if (!texture) {
-            std::println(std::cerr,
-                         "Texture could not be created! SDL Error: {}",
-                         SDL_GetError());
-            SDL_DestroyRenderer(renderer);
-            SDL_DestroyWindow(window);
-            SDL_Quit();
-            ready_promise.set_value(false);
-            return;
-        }
-
-        const size_t uv_size = (WIDTH / 2) * (HEIGHT / 2);
-        std::vector<u8> dummy_uv(uv_size, 0x80);
-
-        std::println("Display thread initialized successfully.");
-        ready_promise.set_value(true);
-
-        while (!running.load(std::memory_order_acquire)) {
-            if (std::this_thread::get_id() == std::thread::id())
-                return;
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-
-        while (running) {
-            u16 frame_id_to_show =
-                g_latest_display_frame_id.load(std::memory_order_acquire);
-
-            if (frame_id_to_show < FRAME_NUM) {
-                const u8 *frame_data =
-                    arena->data +
-                    static_cast<usize>(frame_id_to_show) * FRAME_SIZE;
-                SDL_UpdateYUVTexture(texture, nullptr, frame_data, WIDTH,
+        if (ptr) {
+            if (CHANNEL == 1) {
+                SDL_UpdateYUVTexture(texture, nullptr, ptr, WIDTH,
                                      dummy_uv.data(), WIDTH / 2,
                                      dummy_uv.data(), WIDTH / 2);
-                SDL_RenderCopy(renderer, texture, nullptr, nullptr);
-                SDL_RenderPresent(renderer);
+            } else {
+                SDL_UpdateTexture(texture, nullptr, ptr, WIDTH * 4);
             }
-
-            SDL_Event e;
-            while (SDL_PollEvent(&e) != 0) {
-                if (e.type == SDL_QUIT) {
-                    running = false;
-                }
-            }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(
-                static_cast<u32>(1000 / DISPLAY_HERTZ)));
+            SDL_RenderCopy(renderer, texture, nullptr, nullptr);
+            SDL_RenderPresent(renderer);
         }
 
-        SDL_DestroyTexture(texture);
-        SDL_DestroyRenderer(renderer);
-        SDL_DestroyWindow(window);
-        SDL_Quit();
-    });
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_QUIT)
+                g_running = false;
+        }
 
-    bool consumer_ok = consumer_ready_future.get();
-    bool display_ok = display_ready_future.get();
-
-    if (consumer_ok && display_ok) {
-        std::println("All threads initialized. Starting main loop.");
-        running = true;
-        camera::start(camera_handle);
-    } else {
-        std::println(std::cerr, "ERROR: Thread initialization failed.");
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(1000 / DISPLAY_HERTZ));
     }
+
+    SDL_DestroyTexture(texture);
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+}
+
+int main() {
+    auto cam_handles = camera::init();
+    if (cam_handles.size() < 3) {
+        std::println(std::cerr, "ERROR: Need 3 cameras, found {}",
+                     cam_handles.size());
+        return 1;
+    }
+
+    std::println("Configuring Cameras...");
+    for (auto h : cam_handles) {
+        camera::set_format(h, (CHANNEL == 1) ? camera::GRAY8 : camera::RGBA32);
+
+        camera::set_ir_filter(h, true);
+        camera::set_ir_illumination(h, false);
+
+        camera::set_exposure(h, CAMERA_EXPOSURE);
+        camera::set_gain(h, CAMERA_GAIN);
+    }
+
+    if (!camera::wait_for_sync(5000)) {
+        std::println(stderr, "WARNING: Proceeding without Hardware Sync Lock.");
+    }
+
+    std::vector<std::unique_ptr<CameraContext>> contexts;
+    for (int i = 0; i < 3; ++i) {
+        contexts.push_back(std::make_unique<CameraContext>(i, cam_handles[i]));
+    }
+
+    g_running = false;
+
+    std::vector<std::thread> pool;
+    std::vector<std::future<bool>> display_futures;
+    std::vector<std::future<bool>> encoder_futures;
+
+    std::promise<bool> disp_prom;
+    display_futures.push_back(disp_prom.get_future());
+    pool.emplace_back(display, std::move(disp_prom));
+
+    for (int i = 0; i < 3; ++i) {
+        CameraContext *ctx = contexts[i].get();
+        pool.emplace_back(producer, ctx);
+
+        std::promise<bool> enc_prom;
+        encoder_futures.push_back(enc_prom.get_future());
+        pool.emplace_back(consumer, ctx, std::move(enc_prom));
+    }
+
+    bool all_ok = true;
+    if (!display_futures[0].get()) {
+        std::println("Display init failed.");
+        all_ok = false;
+    }
+    for (auto &fut : encoder_futures) {
+        if (!fut.get()) {
+            std::println("Encoder init failed.");
+            all_ok = false;
+        }
+    }
+
+    if (!all_ok) {
+        g_running = true;
+        for (auto &t : pool)
+            if (t.joinable())
+                t.join();
+        return 1;
+    }
+
+    std::println("All systems ready. Starting Capture...");
+    g_running = true;
 
 #ifndef _WIN32
     RawTerm term_guard;
     fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK);
 #endif
 
-    if (running) {
-        std::println("Press 'p' to pause/resume, 'q' to quit.");
-    }
+    std::println("Controls: [1-3] Switch View, [P] Pause, [Q] Quit");
 
-    while (running) {
-        char ch = 0;
-#ifdef _WIN32
-        if (_kbhit()) {
-            c = _getch();
-        }
-#else
-        if (read(STDIN_FILENO, &ch, 1) <= 0) {
-            ch = 0;
-        }
-#endif
+    int active_idx = 0;
 
-        if (ch == 'p') {
-            paused = !paused.load();
-            std::println("{}", paused ? "Paused" : "Resumed");
-            paused ? camera::stop(camera_handle) : camera::start(camera_handle);
-        } else if (ch == 'q') {
-            running = false;
+    while (g_running) {
+        char c = get_key_nonblocking();
+
+        if (c == 'q')
+            g_running = false;
+        if (c == 'p') {
+            g_paused = !g_paused;
+            std::println("Paused: {}", (bool)g_paused);
+        }
+        if (c == '1' || c == '2' || c == '3') {
+            active_idx = c - '1';
+            std::println("Active View: Cam {} (Serial {})", active_idx,
+                         contexts[active_idx]->serial);
+        }
+
+        u16 frame_id = contexts[active_idx]->latest_frame_id.load(
+            std::memory_order_acquire);
+        if (frame_id < FRAME_NUM) {
+            u8 *ptr = contexts[active_idx]->arena->data +
+                      (static_cast<usize>(frame_id) * FRAME_SIZE);
+            g_live_display_ptr.store(ptr, std::memory_order_relaxed);
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    camera::deinit(camera_handle);
+    for (auto &t : pool)
+        if (t.joinable())
+            t.join();
+    for (auto &ctx : contexts)
+        camera::deinit(ctx->cam_handle);
 
-    producer.join();
-    consumer.join();
-    display.join();
-
-    if (consumer_ok && display_ok) {
-        std::println("Finished. Output: {}", OUTFILE);
-    } else {
-        std::println("Finished with initialization errors.");
-    }
+    std::println("Shutdown complete.");
     return 0;
 }
