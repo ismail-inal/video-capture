@@ -17,7 +17,7 @@ namespace camera {
 
 enum FrameFormat { RGB24, RGBA32, YUV420P, YUV422P, GRAY8 };
 
-// CHANGE: Use shared_ptr to ensure Camera objects stay alive
+// Use shared_ptr to ensure Camera objects stay alive
 typedef std::shared_ptr<CameraLibrary::Camera> handle;
 
 // -----------------------------------------------------------------------------
@@ -28,69 +28,47 @@ inline std::vector<handle> init() {
 #ifdef LIB_CAMERA_IMPLEMENTATION
     std::vector<handle> handles;
 
-    std::println("Initializing OptiTrack Camera Manager...");
+    std::println("[Init] Step 1: Initializing Camera Manager...");
     CameraLibrary::CameraManager::X().WaitForInitialization();
 
     // ------------------------------------------------------------
-    // DISCOVERY LOOP
+    // NAIVE WAIT (Requested Strategy)
     // ------------------------------------------------------------
-    const int target_unique_count = 3;
-    const int timeout_seconds = 10;
-
-    std::println("Scanning for {} UNIQUE cameras (Timeout: {}s)...",
-                 target_unique_count, timeout_seconds);
-
-    auto start_time = std::chrono::steady_clock::now();
-    bool ready = false;
-
-    while (std::chrono::steady_clock::now() - start_time <
-           std::chrono::seconds(timeout_seconds)) {
-        if (CameraLibrary::CameraManager::X().AreCamerasInitialized()) {
-            CameraLibrary::CameraList list;
-            CameraLibrary::CameraManager::X().GetCameraList(list);
-
-            std::set<int> temp_serials;
-            for (int i = 0; i < list.Count(); ++i) {
-                auto cam_ptr =
-                    CameraLibrary::CameraManager::X().GetCamera(list[i].UID());
-                if (cam_ptr) {
-                    temp_serials.insert(cam_ptr->Serial());
-                }
-            }
-
-            if (temp_serials.size() >= target_unique_count) {
-                std::println("Discovery Success: Found {} unique cameras.",
-                             temp_serials.size());
-                ready = true;
-                break;
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-
-    if (!ready) {
-        std::println(stderr, "TIMEOUT: Did not find {} unique cameras in time.",
-                     target_unique_count);
-    }
+    // Instead of polling, we simply give the SDK 4 seconds to finish
+    // network discovery. This avoids thrashing the internal state.
+    std::println("[Init] Step 2: Waiting 4 seconds for discovery to settle...");
+    std::this_thread::sleep_for(std::chrono::seconds(4));
 
     // ------------------------------------------------------------
-    // FINAL LIST BUILDING
+    // ONE-PASS LIST BUILDING & SANITIZATION
     // ------------------------------------------------------------
-    std::println("Building Camera List...");
+    std::println("[Init] Step 3: Acquiring Handles...");
 
     CameraLibrary::CameraList list;
     CameraLibrary::CameraManager::X().GetCameraList(list);
+
+    if (list.Count() == 0) {
+        std::println(stderr, "[Init] Error: No cameras reported by SDK.");
+        return handles;
+    }
+
+    std::println(
+        "[Init] SDK reported {} total entries. Filtering duplicates...",
+        list.Count());
     std::set<int> seen_serials;
 
     for (int i = 0; i < list.Count(); ++i) {
+        // Retrieve shared pointer for this entry
         auto cam_shared =
             CameraLibrary::CameraManager::X().GetCamera(list[i].UID());
 
         if (cam_shared) {
             int serial = cam_shared->Serial();
 
-            // Filter Duplicates
+            // Sanitize: Check if we already have this Serial ID
             if (seen_serials.find(serial) != seen_serials.end()) {
+                std::println("[Init]   - Skipping Duplicate Serial: {}",
+                             serial);
                 continue;
             }
 
@@ -100,21 +78,24 @@ inline std::vector<handle> init() {
         }
     }
 
-    // Sort by Serial Number
+    // Sort by Serial Number to ensure deterministic order (Cam 0, Cam 1,
+    // Cam 2...)
     std::sort(handles.begin(), handles.end(),
               [](handle a, handle b) { return a->Serial() < b->Serial(); });
 
-    std::println("Initialized {} cameras.", handles.size());
+    std::println("[Init] Step 4: Applying Base Settings...");
 
     // Apply Base Settings
     for (size_t i = 0; i < handles.size(); i++) {
         handle cam = handles[i];
         if (cam) {
             cam->SetVideoType(Core::GrayscaleMode);
-            cam->SetNumeric(false, 0);
+            cam->SetNumeric(false, 0); // Turn off ID LED
         }
     }
 
+    std::println("[Init] Complete. Returning {} unique handles.",
+                 handles.size());
     return handles;
 #endif
 }
@@ -157,6 +138,7 @@ inline void get_frame(handle h, u8 *buffer, u32 size,
 
     std::shared_ptr<const CameraLibrary::Frame> frame = nullptr;
 
+    // Blocking wait for a frame.
     while (true) {
         frame = h->LatestFrame();
         if (frame)
