@@ -3,6 +3,7 @@
 #include "types.h"
 #include <algorithm> // For std::sort
 #include <chrono>
+#include <cstdio> // For fflush
 #include <cstring>
 #include <memory> // For std::shared_ptr
 #include <print>
@@ -29,74 +30,92 @@ inline std::vector<handle> init() {
     std::vector<handle> handles;
 
     std::println("[Init] Step 1: Initializing Camera Manager...");
+    fflush(stdout);
     CameraLibrary::CameraManager::X().WaitForInitialization();
 
     // ------------------------------------------------------------
-    // NAIVE WAIT (Requested Strategy)
+    // NAIVE WAIT
     // ------------------------------------------------------------
-    // Instead of polling, we simply give the SDK 4 seconds to finish
-    // network discovery. This avoids thrashing the internal state.
     std::println("[Init] Step 2: Waiting 4 seconds for discovery to settle...");
+    fflush(stdout);
     std::this_thread::sleep_for(std::chrono::seconds(4));
 
     // ------------------------------------------------------------
-    // ONE-PASS LIST BUILDING & SANITIZATION
+    // SCOPED LIST BUILDING
     // ------------------------------------------------------------
     std::println("[Init] Step 3: Acquiring Handles...");
+    fflush(stdout);
 
-    CameraLibrary::CameraList list;
-    CameraLibrary::CameraManager::X().GetCameraList(list);
+    // Create a scope so 'list' is destroyed BEFORE we process/sort handles
+    // further. This helps isolate if the SDK list destructor is the cause of
+    // the crash.
+    {
+        CameraLibrary::CameraList list;
+        CameraLibrary::CameraManager::X().GetCameraList(list);
 
-    if (list.Count() == 0) {
-        std::println(stderr, "[Init] Error: No cameras reported by SDK.");
-        return handles;
-    }
-
-    std::println(
-        "[Init] SDK reported {} total entries. Filtering duplicates...",
-        list.Count());
-    std::set<int> seen_serials;
-
-    for (int i = 0; i < list.Count(); ++i) {
-        // Retrieve shared pointer for this entry
-        auto cam_shared =
-            CameraLibrary::CameraManager::X().GetCamera(list[i].UID());
-
-        if (cam_shared) {
-            int serial = cam_shared->Serial();
-
-            // Sanitize: Check if we already have this Serial ID
-            if (seen_serials.find(serial) != seen_serials.end()) {
-                std::println("[Init]   - Skipping Duplicate Serial: {}",
-                             serial);
-                continue;
-            }
-
-            seen_serials.insert(serial);
-            handles.push_back(cam_shared);
-            std::println("  - Acquired Camera Serial: {}", serial);
+        if (list.Count() == 0) {
+            std::println(stderr, "[Init] Error: No cameras reported by SDK.");
+            return handles;
         }
-    }
 
-    // Sort by Serial Number to ensure deterministic order (Cam 0, Cam 1,
-    // Cam 2...)
+        std::println(
+            "[Init] SDK reported {} total entries. Filtering duplicates...",
+            list.Count());
+        fflush(stdout);
+
+        std::set<int> seen_serials;
+
+        for (int i = 0; i < list.Count(); ++i) {
+            // Retrieve shared pointer for this entry
+            auto cam_shared =
+                CameraLibrary::CameraManager::X().GetCamera(list[i].UID());
+
+            if (cam_shared) {
+                int serial = cam_shared->Serial();
+
+                if (seen_serials.find(serial) != seen_serials.end()) {
+                    continue; // Skip Duplicate
+                }
+
+                seen_serials.insert(serial);
+                handles.push_back(cam_shared);
+                std::println("  - Acquired Camera Serial: {}", serial);
+            }
+        }
+    } // 'list' is destroyed here.
+
+    std::println("[Init] CameraList scope ended. Sorting handles...");
+    fflush(stdout);
+
+    // Sort by Serial Number
     std::sort(handles.begin(), handles.end(),
               [](handle a, handle b) { return a->Serial() < b->Serial(); });
 
     std::println("[Init] Step 4: Applying Base Settings...");
+    fflush(stdout);
 
-    // Apply Base Settings
+    // Apply Base Settings with Safety Checks
     for (size_t i = 0; i < handles.size(); i++) {
         handle cam = handles[i];
         if (cam) {
-            cam->SetVideoType(Core::GrayscaleMode);
-            cam->SetNumeric(false, 0); // Turn off ID LED
+            // Wrapping setters in case accessing properties on "Blue Ring"
+            // (Standby) cameras causes issues
+            try {
+                cam->SetVideoType(Core::GrayscaleMode);
+                cam->SetNumeric(false, 0);
+            } catch (...) {
+                std::println(stderr,
+                             "WARNING: Exception setting properties for Cam {}",
+                             cam->Serial());
+            }
         }
     }
 
     std::println("[Init] Complete. Returning {} unique handles.",
                  handles.size());
-    return handles;
+    fflush(stdout);
+
+    return std::move(handles);
 #endif
 }
 
