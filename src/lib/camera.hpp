@@ -88,15 +88,9 @@ inline std::vector<handle> init() {
                 continue;
             }
 
-            // FIX 3: Check for Error State (E4 often means Sync Signal
-            // missing/unstable) We can't fix hardware errors via code, but we
-            // can log them.
-            if (raw_cam->State() == CameraLibrary::Camera::Uninitialized) {
-                std::println(
-                    stderr,
-                    "WARNING: Camera {} is in Uninitialized/Error state.",
-                    serial);
-            }
+            // [REMOVED] Optional state check causing compilation error
+            // The E4 error (Sync Signal) can be diagnosed by checking if
+            // 'wait_for_sync()' times out later.
 
             seen_serials.insert(serial);
             handles.push_back(raw_cam);
