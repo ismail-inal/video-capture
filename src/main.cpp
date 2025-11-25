@@ -4,7 +4,7 @@
 #include <array>
 #include <atomic>
 #include <boost/lockfree/spsc_queue.hpp>
-#include <filesystem> // Added for directory creation
+#include <filesystem>
 #include <future>
 #include <iostream>
 #include <memory>
@@ -31,7 +31,7 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
-// --- Configuration Constants ---
+// --- Configuration ---
 constexpr const u32 WIDTH = 1920;
 constexpr const u32 HEIGHT = 1080;
 constexpr const u32 CHANNEL = 1;
@@ -46,7 +46,9 @@ constexpr const u32 DISPLAY_HERTZ = 30;
 constexpr const i32 CAMERA_EXPOSURE = 2500;
 constexpr const i32 CAMERA_GAIN = 4;
 
-std::atomic<bool> g_running = false;
+// SEPARATE FLAGS FOR SAFETY
+std::atomic<bool> g_app_running = true;     // Main loop control
+std::atomic<bool> g_capture_active = false; // Start/Stop cameras
 std::atomic<bool> g_paused = false;
 std::atomic<u8 *> g_live_display_ptr{nullptr};
 
@@ -87,6 +89,8 @@ struct CameraContext {
         serial = camera::get_serial(h);
         output_filename = std::format("output/cam_{}.mkv", serial);
 
+        // ALLOCATE MEMORY (Safe)
+        std::println("Allocating 500MB buffer for Cam {}...", serial);
         arena = std::make_unique<Arena>();
 
         for (usize i = 0; i < FRAME_NUM; ++i) {
@@ -125,11 +129,13 @@ char get_key_nonblocking() {
 
 // --- Capture Thread ---
 void run_capture(CameraContext *ctx) {
-    while (!g_running.load(std::memory_order_acquire)) {
-        if (std::this_thread::get_id() == std::thread::id())
-            return;
+    // Wait for the "Go" signal OR the "Die" signal
+    while (g_app_running && !g_capture_active) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+
+    if (!g_app_running)
+        return; // Exit if app is closing
 
     std::println("Cam {} ({}) Capture starting.", ctx->id, ctx->serial);
     camera::start(ctx->cam_handle);
@@ -139,7 +145,7 @@ void run_capture(CameraContext *ctx) {
     bool first_frame = true;
     u16 id;
 
-    while (g_running.load(std::memory_order_relaxed)) {
+    while (g_app_running.load(std::memory_order_relaxed)) {
         if (g_paused.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
@@ -154,7 +160,7 @@ void run_capture(CameraContext *ctx) {
         u64 hardware_id = 0;
 
         int retries = 0;
-        while (g_running) {
+        while (g_app_running) {
             camera::get_frame(ctx->cam_handle, src, FRAME_SIZE, &hardware_id);
 
             if (first_frame) {
@@ -182,7 +188,7 @@ void run_capture(CameraContext *ctx) {
         ctx->latest_frame_id.store(id, std::memory_order_release);
 
         while (!ctx->ready_q.push(id)) {
-            if (!g_running)
+            if (!g_app_running)
                 break;
         }
     }
@@ -242,10 +248,8 @@ void run_encode(CameraContext *ctx, std::promise<bool> ready_promise) {
     if (!(ctx->fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
         if (avio_open(&ctx->fmt_ctx->pb, ctx->output_filename.c_str(),
                       AVIO_FLAG_WRITE) < 0) {
-            std::println(
-                std::cerr,
-                "Cam {} Error: Could not open file '{}'. (Dir exists?)",
-                ctx->id, ctx->output_filename);
+            std::println(std::cerr, "Cam {} Error: Could not open file '{}'.",
+                         ctx->id, ctx->output_filename);
             ready_promise.set_value(false);
             return;
         }
@@ -271,13 +275,12 @@ void run_encode(CameraContext *ctx, std::promise<bool> ready_promise) {
     AVPacket *pkt = av_packet_alloc();
     ready_promise.set_value(true);
 
-    while (!g_running.load(std::memory_order_acquire)) {
-        if (std::this_thread::get_id() == std::thread::id())
-            return;
+    // Wait for start
+    while (g_app_running && !g_capture_active) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    while (g_running.load(std::memory_order_acquire)) {
+    while (g_app_running.load(std::memory_order_acquire)) {
         u16 id;
         if (!ctx->ready_q.pop(id)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -305,11 +308,12 @@ void run_encode(CameraContext *ctx, std::promise<bool> ready_promise) {
         }
 
         while (!ctx->free_q.push(id)) {
-            if (!g_running)
+            if (!g_app_running)
                 break;
         }
     }
 
+    // Flush
     avcodec_send_frame(ctx->enc_ctx, nullptr);
     while (avcodec_receive_packet(ctx->enc_ctx, pkt) == 0) {
         av_packet_rescale_ts(pkt, ctx->enc_ctx->time_base,
@@ -350,13 +354,11 @@ void run_display(std::promise<bool> ready_promise) {
 
     ready_promise.set_value(true);
 
-    while (!g_running.load(std::memory_order_acquire)) {
-        if (std::this_thread::get_id() == std::thread::id())
-            return;
+    while (g_app_running && !g_capture_active) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    while (g_running.load(std::memory_order_relaxed)) {
+    while (g_app_running.load(std::memory_order_relaxed)) {
         u8 *ptr = g_live_display_ptr.load(std::memory_order_relaxed);
 
         if (ptr) {
@@ -374,7 +376,7 @@ void run_display(std::promise<bool> ready_promise) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT)
-                g_running = false;
+                g_app_running = false;
         }
 
         std::this_thread::sleep_for(
@@ -389,17 +391,14 @@ void run_display(std::promise<bool> ready_promise) {
 
 // --- Main Entry ---
 int main() {
-    // 0. CREATE OUTPUT DIRECTORY (Fix for immediate exit)
     try {
         std::filesystem::create_directories("output");
     } catch (const std::exception &e) {
-        std::println(std::cerr,
-                     "ERROR: Could not create 'output' directory: {}",
+        std::println(std::cerr, "ERROR: Output dir creation failed: {}",
                      e.what());
         return 1;
     }
 
-    // 1. Initialize & Sort Cameras
     auto cam_handles = camera::init();
     if (cam_handles.size() < 3) {
         std::println(std::cerr, "ERROR: Need 3 cameras, found {}",
@@ -408,7 +407,6 @@ int main() {
             return 1;
     }
 
-    // 2. Configure Hardware (PrimeX)
     std::println("Configuring Cameras...");
     for (auto h : cam_handles) {
         camera::set_format(h, (CHANNEL == 1) ? camera::GRAY8 : camera::RGBA32);
@@ -418,20 +416,28 @@ int main() {
         camera::set_gain(h, CAMERA_GAIN);
     }
 
-    // 3. Hardware Sync Check
     camera::wait_for_sync(5000);
 
-    // 4. Create Contexts
+    // Context Creation with Memory Safety Check
     std::vector<std::unique_ptr<CameraContext>> contexts;
-    for (size_t i = 0; i < cam_handles.size(); ++i) {
-        if (i >= 3)
-            break;
-        contexts.push_back(std::make_unique<CameraContext>(i, cam_handles[i]));
+    try {
+        for (size_t i = 0; i < cam_handles.size(); ++i) {
+            if (i >= 3)
+                break;
+            contexts.push_back(
+                std::make_unique<CameraContext>(i, cam_handles[i]));
+        }
+    } catch (const std::bad_alloc &e) {
+        std::println(std::cerr,
+                     "CRITICAL ERROR: Memory allocation failed! (System OOM). "
+                     "Reduce buffers/FPS. Error: {}",
+                     e.what());
+        return 1;
     }
 
-    g_running = false;
+    g_app_running = true;
+    g_capture_active = false; // Hold threads
 
-    // 5. Spawn Threads
     std::vector<std::thread> pool;
     std::vector<std::future<bool>> display_futures;
     std::vector<std::future<bool>> encoder_futures;
@@ -448,30 +454,31 @@ int main() {
         pool.emplace_back(run_encode, ctx.get(), std::move(enc_prom));
     }
 
-    // 6. VERIFY INIT
+    // Verify Initialization
     bool all_ok = true;
     if (!display_futures[0].get()) {
-        std::println("Display init failed.");
+        std::println(std::cerr, "Display init failed.");
         all_ok = false;
     }
     for (auto &fut : encoder_futures) {
         if (!fut.get()) {
-            std::println(
-                "Encoder init failed. (Check 'output' folder permissions)");
+            std::println(std::cerr, "Encoder init failed.");
             all_ok = false;
         }
     }
 
     if (!all_ok) {
-        g_running = true;
+        std::println(std::cerr, "Initialization failed. Shutting down...");
+        g_app_running = false;
         for (auto &t : pool)
             if (t.joinable())
                 t.join();
         return 1;
     }
 
+    // --- START SIGNAL ---
     std::println("System Ready. Starting Capture...");
-    g_running = true;
+    g_capture_active = true; // Release threads to start
 
 #ifndef _WIN32
     RawTerm term_guard;
@@ -481,11 +488,11 @@ int main() {
     std::println("Controls: [1-3] Switch View, [P] Pause, [Q] Quit");
     int active_idx = 0;
 
-    while (g_running) {
+    while (g_app_running) {
         char c = get_key_nonblocking();
 
         if (c == 'q')
-            g_running = false;
+            g_app_running = false;
         if (c == 'p') {
             g_paused = !g_paused;
             std::println("Paused: {}", (bool)g_paused);
@@ -512,9 +519,17 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+    std::println("Stopping threads...");
+    g_app_running = false;   // Ensure threads exit loop
+    g_capture_active = true; // Ensure threads aren't stuck in wait state
+
     for (auto &t : pool)
         if (t.joinable())
             t.join();
+
+    // Explicit deinit is usually safe here because shared_ptrs are still valid
+    // but typically CameraManager handles shutdown. We can call Stop just to be
+    // polite.
     for (auto &ctx : contexts)
         camera::deinit(ctx->cam_handle);
 
